@@ -379,7 +379,33 @@ python3 ~/ros2_ws/src/lio_mavros_bridge.py
 
 ## 11. Full Startup Order — Two Drones
 
-Requires the two-drone world SDF setup from Section 9. Each drone needs its own SITL instance, bridge, MAVROS, LIO-SAM, and bridge node — all namespaced separately.
+Requires the two-drone world SDF setup from Section 9. Each drone needs its own SITL instance, bridge, MAVROS, static TF publishers, LIO-SAM, and bridge node — all namespaced separately.
+
+### Namespace Architecture
+
+| Component | Drone 1 | Drone 2 |
+|---|---|---|
+| LiDAR topic | `/drone1/lidar/points` | `/drone2/lidar/points` |
+| IMU topic | `/drone1/imu/data` | `/drone2/imu/data` |
+| Odometry | `/drone1/lio_sam/mapping/odometry_incremental` | `/drone2/lio_sam/mapping/odometry_incremental` |
+| Vision pose | `/drone1/mavros/vision_pose/pose` | `/drone2/mavros/vision_pose/pose` |
+| MAVROS state | `/mavros/state` | `/drone2/mavros/state` |
+| SITL port | 14550 | 14560 |
+| TF base frame | `drone1/base_link` | `drone2/base_link` |
+| TF lidar frame | `drone1/lidar_link` | `drone2/lidar_link` |
+
+### One-time config (run once, not every launch)
+```bash
+cat > ~/ros2_ws/mavros_drone1.yaml << 'EOF'
+tf_prefix: "drone1"
+EOF
+
+cat > ~/ros2_ws/mavros_drone2.yaml << 'EOF'
+tf_prefix: "drone2"
+EOF
+```
+
+### Launch sequence
 
 ```bash
 # Terminal 1 — Gazebo (loads both drone models)
@@ -404,47 +430,72 @@ ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws
 
 # Terminal 6 — MAVROS drone 1 (port 14550)
 source /opt/ros/humble/setup.bash
-ros2 launch mavros apm.launch fcu_url:=udp://:14550@localhost
+ros2 launch mavros apm.launch \
+  fcu_url:=udp://:14550@localhost \
+  tgt_system:=1 \
+  config_yaml:=$HOME/ros2_ws/mavros_drone1.yaml
 
 # Terminal 7 — MAVROS drone 2 (port 14560)
 source /opt/ros/humble/setup.bash
 ros2 launch mavros apm.launch \
   fcu_url:=udp://:14560@localhost \
   tgt_system:=2 \
-  __ns:=/drone2
+  namespace:=drone2/mavros \
+  config_yaml:=$HOME/ros2_ws/mavros_drone2.yaml
 
-# Terminal 8 — LIO-SAM drone 1
+# Terminal 8 — Static TF drone 1
+# Publishes drone1/base_link and drone1/lidar_link frames that LIO-SAM needs
+source /opt/ros/humble/setup.bash
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 base_link drone1/base_link &
+ros2 run tf2_ros static_transform_publisher 0 0 0.1 0 0 0 drone1/base_link drone1/lidar_link
+
+# Terminal 9 — Static TF drone 2
+source /opt/ros/humble/setup.bash
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 base_link drone2/base_link &
+ros2 run tf2_ros static_transform_publisher 0 0 0.1 0 0 0 drone2/base_link drone2/lidar_link
+
+# Terminal 10 — LIO-SAM drone 1
 source ~/ros2_ws/install/setup.bash
 ros2 launch lio_sam run.launch.py params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone1.yaml
 
-# Terminal 9 — LIO-SAM drone 2
+# Terminal 11 — LIO-SAM drone 2
 source ~/ros2_ws/install/setup.bash
 ros2 launch lio_sam run.launch.py params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone2.yaml
 
-# Terminal 10 — LIO-SAM → MAVROS bridge drone 1
+# Terminal 12 — LIO-SAM → MAVROS bridge drone 1
 source ~/ros2_ws/install/setup.bash
 python3 ~/ros2_ws/src/lio_mavros_bridge.py
 
-# Terminal 11 — LIO-SAM → MAVROS bridge drone 2
+# Terminal 13 — LIO-SAM → MAVROS bridge drone 2
 source ~/ros2_ws/install/setup.bash
-python3 ~/ros2_ws/src/lio_mavros_bridge.py \
-  --ros-args \
-  -r /lio_sam/mapping/odometry:=/drone2/lio_sam/mapping/odometry \
-  -r /mavros/vision_pose/pose:=/drone2/mavros/vision_pose/pose
+python3 ~/ros2_ws/src/lio_mavros_bridge.py --ros-args -p drone_ns:=drone2
 ```
 
-Verify both drones are connected:
-```bash
-# Drone 1
-ros2 topic hz /mavros/state
-ros2 topic hz /lio_sam/mapping/odometry
+### Verify both drones are up
 
-# Drone 2
-ros2 topic hz /drone2/mavros/state 2>/dev/null || ros2 topic echo /drone2/mavros/state --once
-ros2 topic hz /drone2/lio_sam/mapping/odometry
+```bash
+# Sensors flowing
+ros2 topic hz /drone1/lidar/points          # ~2Hz
+ros2 topic hz /drone2/lidar/points          # ~2Hz
+ros2 topic hz /drone1/imu/data              # ~1000Hz
+ros2 topic hz /drone2/imu/data              # ~1000Hz
+
+# MAVROS connected (run after param fetch responds in each MAVProxy console)
+ros2 topic echo /mavros/state --once        # connected: true
+ros2 topic echo /drone2/mavros/state --once # connected: true
+
+# Odometry publishing (only after drones are airborne and moving)
+ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental
+ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental
+
+# Vision pose reaching MAVROS
+ros2 topic hz /drone1/mavros/vision_pose/pose
+ros2 topic hz /drone2/mavros/vision_pose/pose
 ```
 
 > **MAVProxy note:** Each SITL instance opens its own MAVProxy console. Drone 1 is on the window that launched with `--map --console`. Drone 2's console is the plain window from `-I1`. Run bootstrap and parameter commands in the correct window for each drone.
+
+> **MAVROS connected: false** is normal immediately after launch. Run `param fetch` in each MAVProxy console — once it responds, MAVROS will connect within a few seconds.
 
 ---
 
