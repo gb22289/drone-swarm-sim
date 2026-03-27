@@ -501,32 +501,68 @@ ros2 topic hz /drone2/mavros/vision_pose/pose
 
 ## 12. GPS-Denied Bootstrap Procedure
 
-Since LIO-SAM needs motion to initialize, use GPS briefly to get airborne:
+Since LIO-SAM needs motion to initialize, use GPS briefly to get airborne. Run these commands in **each drone's MAVProxy console** separately. Always run `param fetch` first and wait for it to respond before setting parameters.
+
+### Step 1 — Enable GPS and take off (both drones)
 
 ```bash
-# In MAVProxy — temporarily enable GPS
+# Run in Drone 1 MAVProxy (--map --console window)
+param fetch
 param set GPS1_TYPE 1
 param set EK3_SRC1_POSXY 3
 param set EK3_SRC1_VELXY 3
 param set VISO_TYPE 0
-
-# Arm and take off
 mode guided
 arm throttle
 takeoff 3
+```
 
-# Once LIO-SAM starts publishing odometry — switch to LiDAR nav
+```bash
+# Run in Drone 2 MAVProxy (-I1 window) — same commands
+param fetch
+param set GPS1_TYPE 1
+param set EK3_SRC1_POSXY 3
+param set EK3_SRC1_VELXY 3
+param set VISO_TYPE 0
+mode guided
+arm throttle
+takeoff 3
+```
+
+### Step 2 — Wait for LIO-SAM to initialize
+
+In a separate terminal, watch for odometry to appear:
+
+```bash
+ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental
+ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental
+```
+
+Both should start publishing within a few seconds of the drones moving.
+
+### Step 3 — Switch to LIO-SAM nav (both drones)
+
+Once odometry is publishing, run in **each** MAVProxy console:
+
+```bash
 param set EK3_SRC1_POSXY 6
 param set EK3_SRC1_VELXY 6
 param set GPS1_TYPE 0
 param set VISO_TYPE 1
 ```
 
-Verify LIO-SAM is publishing:
+### Step 4 — Verify full pipeline
+
 ```bash
-ros2 topic hz /lio_sam/mapping/odometry   # should show data
-ros2 topic hz /mavros/vision_pose/pose    # should show ~2Hz
+ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental  # publishing
+ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental  # publishing
+ros2 topic hz /drone1/mavros/vision_pose/pose               # ~2Hz
+ros2 topic hz /drone2/mavros/vision_pose/pose               # ~2Hz
+ros2 topic echo /mavros/state --once                        # armed: true, guided: true
+ros2 topic echo /drone2/mavros/state --once                 # armed: true, guided: true
 ```
+
+> **Note:** The "Large velocity, reset IMU-preintegration" warning appears periodically due to Gazebo clock synchronisation artefacts from running two SITL instances. This is a known simulation limitation — LIO-SAM self-corrects within ~1 second. Document this in methodology as: *"periodic clock sync artefacts cause brief (~1s) IMU resets at ~30s intervals; measurements taken during stable inter-reset windows."*
 
 ---
 
