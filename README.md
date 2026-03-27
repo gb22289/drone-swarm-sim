@@ -171,7 +171,10 @@ extrinsicRPY: [1.0, 0.0, 0.0,
 
 ## 6. VLP-16 LiDAR Sensor (Gazebo Model)
 
-Add to `~/sim/ardupilot_gazebo/models/iris_with_gimbal/model.sdf` before `</model>`:
+> ⚠️ Add the LiDAR block to **`iris_with_standoffs/model.sdf`**, NOT `iris_with_gimbal/model.sdf`.
+> `iris_with_standoffs` is the nested sub-model that contains `base_link`. Adding it to `iris_with_gimbal` causes a naming collision and the sensor never fires.
+
+Add before the final `</model>` in `~/sim/ardupilot_gazebo/models/iris_with_standoffs/model.sdf`:
 
 ```xml
 <!-- VLP-16 LiDAR -->
@@ -185,7 +188,7 @@ Add to `~/sim/ardupilot_gazebo/models/iris_with_gimbal/model.sdf` before `</mode
       <izz>0.000166667</izz>
     </inertia>
   </inertial>
-  <sensor name="lidar" type="lidar">
+  <sensor name="lidar" type="gpu_lidar">
     <pose>0 0 0 0 0 0</pose>
     <topic>/lidar/points</topic>
     <gz_frame_id>lidar_link</gz_frame_id>
@@ -222,13 +225,19 @@ Add to `~/sim/ardupilot_gazebo/models/iris_with_gimbal/model.sdf` before `</mode
 </link>
 
 <joint name="lidar_joint" type="fixed">
-  <parent>iris_with_standoffs::base_link</parent>
+  <parent>base_link</parent>
   <child>lidar_link</child>
 </joint>
 ```
 
-> Using `type="lidar"` (CPU-based) instead of `gpu_lidar` for ARM64 compatibility.
-> `update_rate` set to 2 Hz due to ARM64 CPU performance limits.
+> **Sensor type must be `gpu_lidar`** — Gazebo Harmonic (gz-sensors 8.x) dropped the CPU `lidar` type. Using `type="lidar"` will register the sensor in the scene but it will never publish data.
+> `update_rate` is set to 2 Hz due to ARM64 CPU performance limits.
+
+Verify the sensor is publishing after launch:
+```bash
+gz topic -e -t /lidar/points/points --duration 5   # should stream binary data
+ros2 topic hz /lidar/points                         # should show ~2 Hz
+```
 
 ---
 
@@ -362,6 +371,137 @@ ros2 topic hz /mavros/vision_pose/pose    # should show ~2Hz
 
 ---
 
+## 11. Autonomous Navigation (GUIDED Mode Waypoints)
+
+Once the drone is airborne and LIO-SAM is active, you can command autonomous movement via MAVROS position setpoints. This is the foundation for the swarm attack experiments.
+
+### Quick test — send a single position command
+
+```bash
+# Confirm MAVROS is receiving pose estimates before sending commands
+ros2 topic echo /mavros/local_position/pose --once
+
+# Send a single position setpoint (x=5m, y=0, z=3m in local frame)
+ros2 topic pub --once /mavros/setpoint_position/local geometry_msgs/msg/PoseStamped \
+  "{header: {frame_id: 'map'}, pose: {position: {x: 5.0, y: 0.0, z: 3.0}, orientation: {w: 1.0}}}"
+```
+
+> The drone will only move if it is already in GUIDED mode and armed. Run `mode guided` in MAVProxy first.
+
+### Waypoint patrol script
+
+Save as `~/ros2_ws/src/waypoint_patrol.py` and run after the bootstrap procedure:
+
+```python
+#!/usr/bin/env python3
+"""
+Simple waypoint patrol for GPS-denied warehouse navigation.
+Requires: drone airborne, LIO-SAM active, MAVROS connected.
+Run: python3 waypoint_patrol.py
+"""
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from mavros_msgs.srv import CommandBool, SetMode
+from mavros_msgs.msg import State
+import time
+
+# Waypoints as (x, y, z) in metres — local ENU frame
+# Adjust to match your warehouse layout
+WAYPOINTS = [
+    ( 5.0,  0.0, 3.0),
+    ( 5.0,  5.0, 3.0),
+    ( 0.0,  5.0, 3.0),
+    ( 0.0,  0.0, 3.0),
+]
+HOLD_TIME = 5.0      # seconds to hold at each waypoint
+TOLERANCE = 0.5      # metres — how close counts as "reached"
+
+class WaypointPatrol(Node):
+    def __init__(self):
+        super().__init__('waypoint_patrol')
+
+        self.state = State()
+        self.current_pose = PoseStamped()
+
+        self.state_sub = self.create_subscription(
+            State, '/mavros/state', self.state_cb, 10)
+        self.pose_sub = self.create_subscription(
+            PoseStamped, '/mavros/local_position/pose', self.pose_cb, 10)
+        self.setpoint_pub = self.create_publisher(
+            PoseStamped, '/mavros/setpoint_position/local', 10)
+
+        self.set_mode_cli = self.create_client(SetMode, '/mavros/set_mode')
+        self.arming_cli  = self.create_client(CommandBool, '/mavros/cmd/arming')
+
+        self.get_logger().info('Waypoint patrol node started')
+
+    def state_cb(self, msg):
+        self.state = msg
+
+    def pose_cb(self, msg):
+        self.current_pose = msg
+
+    def distance_to(self, x, y, z):
+        p = self.current_pose.pose.position
+        return ((p.x - x)**2 + (p.y - y)**2 + (p.z - z)**2) ** 0.5
+
+    def send_setpoint(self, x, y, z):
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        msg.pose.position.x = x
+        msg.pose.position.y = y
+        msg.pose.position.z = z
+        msg.pose.orientation.w = 1.0
+        self.setpoint_pub.publish(msg)
+
+    def run_patrol(self):
+        self.get_logger().info('Starting patrol...')
+        for i, (x, y, z) in enumerate(WAYPOINTS):
+            self.get_logger().info(f'Heading to waypoint {i+1}: ({x}, {y}, {z})')
+            while self.distance_to(x, y, z) > TOLERANCE:
+                self.send_setpoint(x, y, z)
+                time.sleep(0.1)
+                rclpy.spin_once(self, timeout_sec=0)
+            self.get_logger().info(f'Reached waypoint {i+1} — holding {HOLD_TIME}s')
+            hold_end = time.time() + HOLD_TIME
+            while time.time() < hold_end:
+                self.send_setpoint(x, y, z)
+                time.sleep(0.1)
+                rclpy.spin_once(self, timeout_sec=0)
+        self.get_logger().info('Patrol complete')
+
+def main():
+    rclpy.init()
+    node = WaypointPatrol()
+    # Brief wait for connections
+    time.sleep(2.0)
+    node.run_patrol()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+Run it:
+```bash
+python3 ~/ros2_ws/src/waypoint_patrol.py
+```
+
+Monitor progress:
+```bash
+# Watch drone position update in real time
+ros2 topic echo /mavros/local_position/pose
+
+# Confirm LIO-SAM is still tracking during movement
+ros2 topic hz /lio_sam/mapping/odometry
+```
+
+> **If the drone doesn't move:** confirm it is in GUIDED mode (`mode guided` in MAVProxy) and that `/mavros/local_position/pose` is publishing. The drone must be receiving a continuous stream of setpoints — a single publish is not sufficient for GUIDED mode.
+
+---
+
 ## Architecture Overview
 
 ```
@@ -386,6 +526,8 @@ Gazebo Sim (iris_warehouse)
         MAVROS
            │
     ArduCopter SITL (EKF3 External Nav)
+           │
+    /mavros/setpoint_position/local  ← waypoint_patrol.py sends targets here
 ```
 
 ---
@@ -398,6 +540,10 @@ Gazebo Sim (iris_warehouse)
 | `AHRS: waiting for home` | GPS not locked — restart SITL after setting `GPS1_TYPE 1` |
 | `EKF3 IMU stopped aiding` | Re-enable compass: `COMPASS_ENABLE 1`, `EK3_SRC1_YAW 1` |
 | `param set` Unknown setting | Run `param fetch` first to refresh cache |
-| LiDAR not in ROS2 | Check bridge is running after Gazebo loads; use `/lidar/points/points` as gz topic |
+| LiDAR not in ROS2 | Check bridge is running after Gazebo loads; verify gz topic is `/lidar/points/points` |
 | LIO-SAM no odometry on flat ground | Switch to warehouse world — runway is too featureless for SLAM |
 | `ros-humble-ros-gzharmonic` not found | Build ros_gz from source with `GZ_VERSION=harmonic` |
+| LiDAR sensor registered but zero messages | Ensure `type="gpu_lidar"` in model SDF — `type="lidar"` is not supported in Gazebo Harmonic |
+| LiDAR link renamed to `lidar_link(1)` | LiDAR block is in wrong model file — must be in `iris_with_standoffs`, not `iris_with_gimbal` |
+| Drone ignores setpoint commands | Must be in GUIDED mode (`mode guided` in MAVProxy) and continuously publishing setpoints |
+| `/mavros/local_position/pose` not publishing | MAVROS not receiving vision pose — check lio_mavros_bridge.py is running |
