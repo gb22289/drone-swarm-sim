@@ -368,7 +368,7 @@ ros2 launch mavros apm.launch fcu_url:=udp://:14550@localhost
 
 # Terminal 5 — LIO-SAM (drone 1)
 source ~/ros2_ws/install/setup.bash
-ros2 launch lio_sam run.launch.py
+ros2 launch lio_sam run.launch.py params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone1.yaml
 
 # Terminal 6 — LIO-SAM → MAVROS bridge (drone 1)
 source ~/ros2_ws/install/setup.bash
@@ -415,16 +415,11 @@ ros2 launch mavros apm.launch \
 
 # Terminal 8 — LIO-SAM drone 1
 source ~/ros2_ws/install/setup.bash
-ros2 launch lio_sam run.launch.py
+ros2 launch lio_sam run.launch.py params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone1.yaml
 
-# Terminal 9 — LIO-SAM drone 2 (remapped to drone2 topics)
+# Terminal 9 — LIO-SAM drone 2
 source ~/ros2_ws/install/setup.bash
-ros2 launch lio_sam run.launch.py \
-  --ros-args \
-  -r /lidar/points:=/drone2/lidar/points \
-  -r /imu/data:=/drone2/imu/data \
-  -r /lio_sam/mapping/odometry:=/drone2/lio_sam/mapping/odometry \
-  --params-file ~/ros2_ws/src/LIO-SAM/config/params.yaml
+ros2 launch lio_sam run.launch.py params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone2.yaml
 
 # Terminal 10 — LIO-SAM → MAVROS bridge drone 1
 source ~/ros2_ws/install/setup.bash
