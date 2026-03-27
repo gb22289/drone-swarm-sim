@@ -308,39 +308,152 @@ if __name__ == '__main__':
 
 ---
 
-## 9. Full Startup Order
+## 9. Two-Drone World Setup
+
+Before launching two drones, you need a second iris model spawned at a different position in the warehouse. The easiest approach is to add a second model include directly in the world SDF.
+
+Edit `~/sim/ardupilot_gazebo/worlds/iris_warehouse.sdf` and add a second drone inside the `<world>` tag (after the first drone's `<include>` block):
+
+```xml
+<!-- Drone 2 — offset 3m on Y axis so they don't overlap -->
+<include>
+  <uri>model://iris_with_gimbal</uri>
+  <name>iris_with_gimbal_2</name>
+  <pose>0 3 0.2 0 0 0</pose>
+</include>
+```
+
+> Each drone needs a unique `<name>` — this is what Gazebo uses to namespace its sensor topics. Drone 2's LiDAR will publish to `/drone2/lidar/points/points` and its IMU to the equivalent path. Verify after launch with `gz topic -l | grep iris_with_gimbal_2`.
+
+Also create a second bridge config at `~/ros2_ws/bridge2.yaml`:
+
+```yaml
+- ros_topic_name: "/drone2/lidar/points"
+  gz_topic_name: "/drone2/lidar/points/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/drone2/imu/data"
+  gz_topic_name: "/world/iris_warehouse/model/iris_with_gimbal_2/model/iris_with_standoffs/link/imu_link/sensor/imu_sensor/imu"
+  ros_type_name: "sensor_msgs/msg/Imu"
+  gz_type_name: "gz.msgs.IMU"
+  direction: GZ_TO_ROS
+```
+
+> Check the exact Gazebo IMU topic path for drone 2 with: `gz topic -l | grep imu | grep gimbal_2`
+
+---
+
+## 10. Full Startup Order — Single Drone
 
 Run each in a separate terminal in this exact order:
 
 ```bash
-# 1. Gazebo
+# Terminal 1 — Gazebo
 cd ~/sim/ardupilot_gazebo
 gz sim worlds/iris_warehouse.sdf -r
 
-# 2. SITL (wait for Gazebo to fully load first)
+# Terminal 2 — SITL drone 1 (wait for Gazebo to fully load first)
 cd ~/sim/ardupilot/ArduCopter
-sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console
+sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
 
-# 3. ros_gz bridge
+# Terminal 3 — ros_gz bridge (drone 1)
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
 
-# 4. MAVROS
+# Terminal 4 — MAVROS (drone 1, port 14550)
 source /opt/ros/humble/setup.bash
 ros2 launch mavros apm.launch fcu_url:=udp://:14550@localhost
 
-# 5. LIO-SAM
+# Terminal 5 — LIO-SAM (drone 1)
 source ~/ros2_ws/install/setup.bash
 ros2 launch lio_sam run.launch.py
 
-# 6. LIO-SAM → MAVROS bridge node
+# Terminal 6 — LIO-SAM → MAVROS bridge (drone 1)
 source ~/ros2_ws/install/setup.bash
 python3 ~/ros2_ws/src/lio_mavros_bridge.py
 ```
 
 ---
 
-## 10. GPS-Denied Bootstrap Procedure
+## 11. Full Startup Order — Two Drones
+
+Requires the two-drone world SDF setup from Section 9. Each drone needs its own SITL instance, bridge, MAVROS, LIO-SAM, and bridge node — all namespaced separately.
+
+```bash
+# Terminal 1 — Gazebo (loads both drone models)
+cd ~/sim/ardupilot_gazebo
+gz sim worlds/iris_warehouse.sdf -r
+
+# Terminal 2 — SITL drone 1 (instance 0, ports 14550/14551)
+cd ~/sim/ardupilot/ArduCopter
+sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
+
+# Terminal 3 — SITL drone 2 (instance 1, ports 14560/14561)
+cd ~/sim/ardupilot/ArduCopter
+sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console -I1
+
+# Terminal 4 — ros_gz bridge drone 1
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
+
+# Terminal 5 — ros_gz bridge drone 2
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge2.yaml
+
+# Terminal 6 — MAVROS drone 1 (port 14550)
+source /opt/ros/humble/setup.bash
+ros2 launch mavros apm.launch fcu_url:=udp://:14550@localhost
+
+# Terminal 7 — MAVROS drone 2 (port 14560)
+source /opt/ros/humble/setup.bash
+ros2 launch mavros apm.launch \
+  fcu_url:=udp://:14560@localhost \
+  tgt_system:=2 \
+  __ns:=/drone2
+
+# Terminal 8 — LIO-SAM drone 1
+source ~/ros2_ws/install/setup.bash
+ros2 launch lio_sam run.launch.py
+
+# Terminal 9 — LIO-SAM drone 2 (remapped to drone2 topics)
+source ~/ros2_ws/install/setup.bash
+ros2 launch lio_sam run.launch.py \
+  --ros-args \
+  -r /lidar/points:=/drone2/lidar/points \
+  -r /imu/data:=/drone2/imu/data \
+  -r /lio_sam/mapping/odometry:=/drone2/lio_sam/mapping/odometry \
+  --params-file ~/ros2_ws/src/LIO-SAM/config/params.yaml
+
+# Terminal 10 — LIO-SAM → MAVROS bridge drone 1
+source ~/ros2_ws/install/setup.bash
+python3 ~/ros2_ws/src/lio_mavros_bridge.py
+
+# Terminal 11 — LIO-SAM → MAVROS bridge drone 2
+source ~/ros2_ws/install/setup.bash
+python3 ~/ros2_ws/src/lio_mavros_bridge.py \
+  --ros-args \
+  -r /lio_sam/mapping/odometry:=/drone2/lio_sam/mapping/odometry \
+  -r /mavros/vision_pose/pose:=/drone2/mavros/vision_pose/pose
+```
+
+Verify both drones are connected:
+```bash
+# Drone 1
+ros2 topic hz /mavros/state
+ros2 topic hz /lio_sam/mapping/odometry
+
+# Drone 2
+ros2 topic hz /drone2/mavros/state 2>/dev/null || ros2 topic echo /drone2/mavros/state --once
+ros2 topic hz /drone2/lio_sam/mapping/odometry
+```
+
+> **MAVProxy note:** Each SITL instance opens its own MAVProxy console. Drone 1 is on the window that launched with `--map --console`. Drone 2's console is the plain window from `-I1`. Run bootstrap and parameter commands in the correct window for each drone.
+
+---
+
+## 12. GPS-Denied Bootstrap Procedure
 
 Since LIO-SAM needs motion to initialize, use GPS briefly to get airborne:
 
@@ -371,7 +484,7 @@ ros2 topic hz /mavros/vision_pose/pose    # should show ~2Hz
 
 ---
 
-## 11. Autonomous Navigation (GUIDED Mode Waypoints)
+## 13. Autonomous Navigation (GUIDED Mode Waypoints)
 
 Once the drone is airborne and LIO-SAM is active, you can command autonomous movement via MAVROS position setpoints. This is the foundation for the swarm attack experiments.
 
