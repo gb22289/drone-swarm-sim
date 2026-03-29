@@ -359,9 +359,9 @@ sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
 
-# Terminal 4 — MAVROS (drone 1, port 14550)
+# Terminal 4 — MAVROS (drone 1, port 14551)
 source /opt/ros/humble/setup.bash
-ros2 launch mavros apm.launch fcu_url:=udp://:14550@localhost
+ros2 launch mavros apm.launch fcu_url:=udp://:14551@localhost
 
 # Terminal 5 — LIO-SAM (drone 1)
 source ~/ros2_ws/install/setup.bash
@@ -389,7 +389,7 @@ Requires the two-drone world SDF setup from Section 9. Each drone needs its own 
 | Odometry | `/drone1/lio_sam/mapping/odometry_incremental` | `/drone2/lio_sam/mapping/odometry_incremental` |
 | Vision pose | `/drone1/mavros/vision_pose/pose` | `/drone2/mavros/vision_pose/pose` |
 | MAVROS state | `/mavros/state` | `/drone2/mavros/state` |
-| SITL port | 14550 | 14560 |
+| SITL port (MAVROS) | 14551 | 14561 |
 | TF base frame | `drone1/base_link` | `drone2/base_link` |
 | TF lidar frame | `drone1/lidar_link` | `drone2/lidar_link` |
 
@@ -398,10 +398,12 @@ Requires the two-drone world SDF setup from Section 9. Each drone needs its own 
 ```bash
 cat > ~/ros2_ws/mavros_drone1.yaml << 'EOF'
 tf_prefix: "drone1"
+use_sim_time: true
 EOF
 
 cat > ~/ros2_ws/mavros_drone2.yaml << 'EOF'
 tf_prefix: "drone2"
+use_sim_time: true
 EOF
 ```
 
@@ -420,6 +422,19 @@ sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
 cd ~/sim/ardupilot/ArduCopter
 sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console -I1
 
+# --- MAVProxy output setup (run in each MAVProxy console) ---
+# IMPORTANT: sim_vehicle.py only forwards MAVLink to the Windows host IP.
+# MAVROS runs inside WSL and needs a localhost output. Run these BEFORE
+# launching MAVROS, in the correct MAVProxy console for each drone.
+#
+# Drone 1 MAVProxy console (--map --console window):
+#   output add 127.0.0.1:14551
+#
+# Drone 2 MAVProxy console (-I1 window):
+#   output add 127.0.0.1:14561
+#
+# Verify with: output  (lists all active outputs)
+
 # Terminal 4 — ros_gz bridge drone 1
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
@@ -428,17 +443,17 @@ ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge2.yaml
 
-# Terminal 6 — MAVROS drone 1 (port 14550)
+# Terminal 6 — MAVROS drone 1 (port 14551)
 source /opt/ros/humble/setup.bash
 ros2 launch mavros apm.launch \
-  fcu_url:=udp://:14550@localhost \
+  fcu_url:=udp://:14551@localhost \
   tgt_system:=1 \
   config_yaml:=$HOME/ros2_ws/mavros_drone1.yaml
 
-# Terminal 7 — MAVROS drone 2 (port 14560)
+# Terminal 7 — MAVROS drone 2 (port 14561)
 source /opt/ros/humble/setup.bash
 ros2 launch mavros apm.launch \
-  fcu_url:=udp://:14560@localhost \
+  fcu_url:=udp://:14561@localhost \
   tgt_system:=2 \
   namespace:=drone2/mavros \
   config_yaml:=$HOME/ros2_ws/mavros_drone2.yaml
@@ -512,7 +527,7 @@ ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental
 
 > **MAVProxy note:** Each SITL instance opens its own MAVProxy console. Drone 1 is on the window that launched with `--map --console`. Drone 2's console is the plain window from `-I1`. Run bootstrap and parameter commands in the correct window for each drone.
 
-> **MAVROS connected: false** is normal immediately after launch. Run `param fetch` in each MAVProxy console — once it responds, MAVROS will connect within a few seconds.
+> **MAVROS connected: false** is normal immediately after launch — wait a few seconds for the heartbeat. If it stays `connected: false`, check: (1) you ran `output add 127.0.0.1:14551` / `14561` in the correct MAVProxy console, (2) MAVROS is using port 14551/14561 not 14550/14560, (3) the output was added in the right drone's MAVProxy (check with `output` command — drone 2's MAVROS seeing system ID 1 means the output was added in drone 1's console by mistake).
 
 ---
 
