@@ -355,13 +355,18 @@ gz sim worlds/iris_warehouse.sdf -r
 cd ~/sim/ardupilot/ArduCopter
 sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
 
+# --- In Drone 1 MAVProxy console, add localhost output for MAVROS ---
+#   output add 127.0.0.1:14551
+
 # Terminal 3 — ros_gz bridge (drone 1)
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
 
 # Terminal 4 — MAVROS (drone 1, port 14551)
 source /opt/ros/humble/setup.bash
-ros2 launch mavros apm.launch fcu_url:=udp://:14551@localhost
+ros2 launch mavros apm.launch fcu_url:=udp://:14551@localhost \
+  tgt_system:=1 \
+  config_yaml:=$HOME/ros2_ws/mavros_drone1.yaml
 
 # Terminal 5 — LIO-SAM (drone 1)
 source ~/ros2_ws/install/setup.bash
@@ -397,13 +402,17 @@ Requires the two-drone world SDF setup from Section 9. Each drone needs its own 
 
 ```bash
 cat > ~/ros2_ws/mavros_drone1.yaml << 'EOF'
-tf_prefix: "drone1"
-use_sim_time: true
+/**:
+  ros__parameters:
+    tf_prefix: "drone1"
+    use_sim_time: true
 EOF
 
 cat > ~/ros2_ws/mavros_drone2.yaml << 'EOF'
-tf_prefix: "drone2"
-use_sim_time: true
+/**:
+  ros__parameters:
+    tf_prefix: "drone2"
+    use_sim_time: true
 EOF
 ```
 
@@ -434,6 +443,7 @@ sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console -I1
 #   output add 127.0.0.1:14561
 #
 # Verify with: output  (lists all active outputs)
+# NOTE: output add does NOT survive SITL reboots. Re-add after every reboot.
 
 # Terminal 4 — ros_gz bridge drone 1
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
@@ -543,6 +553,7 @@ param fetch
 param set GPS1_TYPE 1
 param set EK3_SRC1_POSXY 3
 param set EK3_SRC1_VELXY 3
+param set EK3_SRC1_YAW 1
 param set VISO_TYPE 0
 mode guided
 arm throttle
@@ -555,6 +566,7 @@ param fetch
 param set GPS1_TYPE 1
 param set EK3_SRC1_POSXY 3
 param set EK3_SRC1_VELXY 3
+param set EK3_SRC1_YAW 1
 param set VISO_TYPE 0
 mode guided
 arm throttle
@@ -570,19 +582,28 @@ ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental
 ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental
 ```
 
-Both should start publishing within a few seconds of the drones moving.
+Both should start publishing within a few seconds of the drones moving. Also verify vision_pose is reaching MAVROS:
+
+```bash
+ros2 topic hz /mavros/vision_pose/pose              # ~1.5Hz
+ros2 topic hz /drone2/mavros/vision_pose/pose       # ~1.5Hz
+```
 
 ### Step 3 — Switch to LIO-SAM nav (both drones)
 
-Once odometry is publishing, run in **each** MAVProxy console:
+Once odometry is publishing **and** `ros2 topic hz /mavros/vision_pose/pose` shows ~1.5 Hz, run in **each** MAVProxy console:
 
 ```bash
+param set VISO_DELAY_MS 700
 param set EK3_SRC1_POSXY 6
 param set EK3_SRC1_VELXY 6
+param set EK3_SRC1_VELZ 0
 param set EK3_SRC1_YAW 6
 param set GPS1_TYPE 0
 param set VISO_TYPE 1
 ```
+
+> `VISO_DELAY_MS 700` tells the EKF to expect ~700ms latency, matching the ~1.5 Hz LIO-SAM update rate. `EK3_SRC1_VELZ 0` disables GPS velocity Z (since GPS is now off). You should see **"EKF3 IMU0 is using external nav data"** in the MAVProxy console — this message only appears once per EKF initialization.
 
 ### Step 4 — Verify full pipeline
 
