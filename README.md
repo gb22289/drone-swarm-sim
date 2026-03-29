@@ -395,6 +395,7 @@ Requires the two-drone world SDF setup from Section 9. Each drone needs its own 
 | Vision pose | `/drone1/mavros/vision_pose/pose` | `/drone2/mavros/vision_pose/pose` |
 | MAVROS state | `/mavros/state` | `/drone2/mavros/state` |
 | SITL port (MAVROS) | 14551 | 14561 |
+| MAV_SYSID | 1 (default) | **2** (must set manually) |
 | TF base frame | `drone1/base_link` | `drone2/base_link` |
 | TF lidar frame | `drone1/lidar_link` | `drone2/lidar_link` |
 
@@ -431,7 +432,7 @@ sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
 cd ~/sim/ardupilot/ArduCopter
 sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console -I1
 
-# --- MAVProxy output setup (run in each MAVProxy console) ---
+# --- MAVProxy output + system ID setup (run in each MAVProxy console) ---
 # IMPORTANT: sim_vehicle.py only forwards MAVLink to the Windows host IP.
 # MAVROS runs inside WSL and needs a localhost output. Run these BEFORE
 # launching MAVROS, in the correct MAVProxy console for each drone.
@@ -441,9 +442,18 @@ sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console -I1
 #
 # Drone 2 MAVProxy console (-I1 window):
 #   output add 127.0.0.1:14561
+#   param set MAV_SYSID 2
+#   param save
+#
+# MAV_SYSID: Both SITL instances default to system ID 1. Drone 2's MAVROS
+# uses tgt_system:=2, so it will ignore packets from system 1. You MUST
+# set MAV_SYSID to 2 on drone 2's SITL. The "Failed to set" warning is
+# normal — the system ID change confuses MAVProxy, but it takes effect.
+# MAV_SYSID survives param save, so you only need to set it once.
 #
 # Verify with: output  (lists all active outputs)
 # NOTE: output add does NOT survive SITL reboots. Re-add after every reboot.
+# NOTE: MAV_SYSID DOES survive reboots (saved to eeprom).
 
 # Terminal 4 — ros_gz bridge drone 1
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
@@ -594,7 +604,7 @@ ros2 topic hz /drone2/mavros/vision_pose/pose       # ~1.5Hz
 Once odometry is publishing **and** `ros2 topic hz /mavros/vision_pose/pose` shows ~1.5 Hz, run in **each** MAVProxy console:
 
 ```bash
-param set VISO_DELAY_MS 700
+param set VISO_DELAY_MS 50
 param set EK3_SRC1_POSXY 6
 param set EK3_SRC1_VELXY 6
 param set EK3_SRC1_VELZ 0
@@ -603,7 +613,7 @@ param set GPS1_TYPE 0
 param set VISO_TYPE 1
 ```
 
-> `VISO_DELAY_MS 700` tells the EKF to expect ~700ms latency, matching the ~1.5 Hz LIO-SAM update rate. `EK3_SRC1_VELZ 0` disables GPS velocity Z (since GPS is now off). You should see **"EKF3 IMU0 is using external nav data"** in the MAVProxy console — this message only appears once per EKF initialization.
+> `VISO_DELAY_MS 50` tells the EKF the expected latency of vision data. `EK3_SRC1_VELZ 0` disables GPS velocity Z (since GPS is now off). You should see **"EKF3 IMU0 is using external nav data"** in the MAVProxy console — this message only appears once per EKF initialization.
 
 ### Step 4 — Verify full pipeline
 
@@ -905,30 +915,74 @@ mission_results.csv     (thesis data: reported vs actual coverage)
 
 Each drone reads its assigned waypoints from `config/waypoints.yaml`, flies to them via MAVROS setpoints, and publishes completion to the shared topic. The ground truth logger independently tracks drone positions from LIO-SAM odometry to verify what was actually visited.
 
+### Prerequisites before launching mission
+
+1. Both drones airborne via bootstrap procedure (Section 12)
+2. Both drones in **GUIDED mode** — run `mode guided` in both MAVProxy consoles
+3. Verify MAVROS local_position is publishing for both drones:
+   ```bash
+   ros2 topic hz /mavros/local_position/pose         # drone 1
+   ros2 topic hz /drone2/mavros/local_position/pose   # drone 2
+   ```
+
+### Key technical notes
+
+- **Setpoint rate:** ArduCopter GUIDED mode requires continuous setpoints at ≥10 Hz. The navigator uses a 20 Hz timer.
+- **Position source:** Navigator reads from MAVROS `local_position/pose` (EKF output frame), NOT LIO-SAM odometry. This ensures setpoints and position readings are in the same frame.
+- **Coordinate conversion:** Waypoints in `config/waypoints.yaml` are in Gazebo world coordinates. The navigator converts them to MAVROS local frame using spawn position offsets: `local = world - spawn`.
+- **Spawn positions:** Drone 1 spawns at (-6, 0), drone 2 at (-3, 0) in the warehouse SDF. These must be passed as parameters.
+- **No use_sim_time:** Do NOT pass `use_sim_time:=true` to the navigator nodes — it throttles the 20 Hz setpoint timer and ArduCopter stops responding.
+
 ### Run — Honest scenario (baseline)
 
-After completing the bootstrap procedure (Section 12) with both drones airborne:
+After completing prerequisites above, run in separate terminals:
 
 ```bash
-# Option A: launch file (both navigators + logger)
-ros2 launch swarm_mission mission.launch.py
+# Terminal 14 — Build (if not already built)
+cd ~/ros2_ws && colcon build --packages-select swarm_mission && source install/setup.bash
 
-# Option B: run nodes individually for more control
-ros2 run swarm_mission waypoint_navigator --ros-args -p drone_id:=drone1 -p byzantine:=false &
-ros2 run swarm_mission waypoint_navigator --ros-args -p drone_id:=drone2 -p byzantine:=false &
-ros2 run swarm_mission ground_truth_logger
+# Terminal 15 — Drone 1 navigator
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission waypoint_navigator --ros-args \
+  -p drone_id:=drone1 -p byzantine:=false \
+  -p spawn_x:=-6.0 -p spawn_y:=0.0 \
+  -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
+
+# Terminal 16 — Drone 2 navigator
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission waypoint_navigator --ros-args \
+  -p drone_id:=drone2 -p byzantine:=false \
+  -p spawn_x:=-3.0 -p spawn_y:=0.0 \
+  -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
+
+# Terminal 17 — Ground truth logger
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission ground_truth_logger --ros-args \
+  -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
 ```
 
 ### Run — Byzantine scenario (drone 2 lies)
 
+Same as above, but change drone 2's terminal to:
+
 ```bash
-ros2 run swarm_mission waypoint_navigator --ros-args -p drone_id:=drone1 -p byzantine:=false &
-ros2 run swarm_mission waypoint_navigator --ros-args -p drone_id:=drone2 -p byzantine:=true &
-ros2 run swarm_mission ground_truth_logger
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission waypoint_navigator --ros-args \
+  -p drone_id:=drone2 -p byzantine:=true \
+  -p spawn_x:=-3.0 -p spawn_y:=0.0 \
+  -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
 ```
 
-In Byzantine mode, drone 2 immediately reports all its assigned waypoints as visited without flying to them. Drone 1 sees these reports and finishes early, believing full coverage was achieved. The ground truth logger records the gap.
+In Byzantine mode, drone 2 immediately reports all its assigned waypoints as visited without flying to them. Drone 1 sees these reports and skips them, believing full coverage was achieved. The ground truth logger records the gap.
 
+### Expected thesis results
+
+| Scenario | Reported coverage | Actual coverage | Coverage gap |
+|---|---|---|---|
+| Honest (baseline) | 12/12 (100%) | 12/12 (100%) | 0 |
+| Byzantine (drone 2) | 12/12 (100%) | 6/12 (50%) | 6 waypoints |
+
+Results are appended to `~/ros2_ws/mission_results.csv` with per-waypoint breakdown and timestamps.
 
 ### Waypoint configuration
 
@@ -961,3 +1015,9 @@ Edit `config/waypoints.yaml` to adjust the 4x3 grid of 12 waypoints covering the
 | MAVROS `connected: false` — drone 2 sees system ID 1 | `output add` was run in drone 1's MAVProxy by mistake. Remove it there, add in drone 2's |
 | No "EKF3 is using external nav" after param switch | Message only appears once per EKF init. If params are set and vision_pose is flowing, it's working — verify with stable hover after GPS off |
 | `PreArm: VisOdom: not healthy` oscillating | Normal at ~1.5 Hz — the 300ms health check timeout causes oscillation. Arm with GPS first (VISO_TYPE 0), switch mid-flight |
+| MAVROS drone 2 `detected remote address 1.1` | Both SITL instances default to MAV_SYSID=1. Run `param set MAV_SYSID 2` and `param save` in drone 2's MAVProxy |
+| `VISO_DELAY_MS` not found | Parameter exists in ArduCopter V4.8.0-dev as `VISO_DELAY_MS` (not `VISO_DELAY`). Run `param show VISO_*` to check |
+| Drone doesn't move despite GUIDED mode + setpoints | Setpoint publish rate too low — ArduCopter needs continuous stream at ≥10 Hz. The navigator uses 20 Hz timer. Do NOT use `use_sim_time:=true` on navigator nodes |
+| Navigator QoS warning on `local_position/pose` | MAVROS publishes with BEST_EFFORT QoS. Subscriber must match — use `QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT)` |
+| Drone flies to wrong position | Coordinate frame mismatch — waypoints are in Gazebo world frame, MAVROS uses local EKF frame. Convert with spawn offset: `local = world - spawn` |
+| Ground truth logger shows FALSE CLAIM for all | Logger's LIO-SAM odometry subscription may have QoS mismatch or topic name issue — known bug, does not affect mission execution |
