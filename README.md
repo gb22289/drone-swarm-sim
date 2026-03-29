@@ -871,6 +871,71 @@ Gazebo Sim (iris_warehouse)
 
 ---
 
+## 15. Cooperative Inspection Mission (Byzantine Fault Experiments)
+
+GPS-denied environments force drones to rely on cooperative data sharing — there is no external oracle to verify position claims. This mission exploits that trust dependency: drones divide a warehouse into waypoint zones, share completion status, and skip waypoints reported as visited by partners. A Byzantine drone can exploit this by falsely reporting coverage, leaving blind spots.
+
+### Install the mission package
+
+```bash
+cp -r ~/ros2_ws/src/swarm_mission ~/ros2_ws/src/
+cd ~/ros2_ws
+colcon build --packages-select swarm_mission
+source install/setup.bash
+```
+
+### Architecture
+
+```
+/swarm/waypoint_status   (std_msgs/String, JSON)
+    ^                         ^
+    |  publishes               |  publishes
+    |                         |
+[drone1/waypoint_navigator]  [drone2/waypoint_navigator]
+    |  subscribes              |  subscribes
+    v                         v
+/swarm/waypoint_status   (reads partner reports, skips covered waypoints)
+    |
+    v
+[ground_truth_logger]   (compares reports vs actual LIO-SAM positions)
+    |
+    v
+mission_results.csv     (thesis data: reported vs actual coverage)
+```
+
+Each drone reads its assigned waypoints from `config/waypoints.yaml`, flies to them via MAVROS setpoints, and publishes completion to the shared topic. The ground truth logger independently tracks drone positions from LIO-SAM odometry to verify what was actually visited.
+
+### Run — Honest scenario (baseline)
+
+After completing the bootstrap procedure (Section 12) with both drones airborne:
+
+```bash
+# Option A: launch file (both navigators + logger)
+ros2 launch swarm_mission mission.launch.py
+
+# Option B: run nodes individually for more control
+ros2 run swarm_mission waypoint_navigator --ros-args -p drone_id:=drone1 -p byzantine:=false &
+ros2 run swarm_mission waypoint_navigator --ros-args -p drone_id:=drone2 -p byzantine:=false &
+ros2 run swarm_mission ground_truth_logger
+```
+
+### Run — Byzantine scenario (drone 2 lies)
+
+```bash
+ros2 run swarm_mission waypoint_navigator --ros-args -p drone_id:=drone1 -p byzantine:=false &
+ros2 run swarm_mission waypoint_navigator --ros-args -p drone_id:=drone2 -p byzantine:=true &
+ros2 run swarm_mission ground_truth_logger
+```
+
+In Byzantine mode, drone 2 immediately reports all its assigned waypoints as visited without flying to them. Drone 1 sees these reports and finishes early, believing full coverage was achieved. The ground truth logger records the gap.
+
+
+### Waypoint configuration
+
+Edit `config/waypoints.yaml` to adjust the 4x3 grid of 12 waypoints covering the warehouse. Zone assignments control which drone is responsible for which waypoints.
+
+---
+
 ## Troubleshooting
 
 | Issue | Fix |
@@ -892,3 +957,7 @@ Gazebo Sim (iris_warehouse)
 | Vision pose `Subscription count: 0` | MAVROS namespace mismatch — add remap to bridge (Terminal 12) |
 | `use_sim_time` not taking effect | Check for duplicate `/**:` blocks or duplicate `ros__parameters:` keys in YAML |
 | "Not enough features" → drift | Lower `edgeFeatureMinValidNum` to 2, `edgeThreshold` to 0.5 |
+| MAVROS `connected: false` persists | Run `output add 127.0.0.1:14551` (drone 1) or `14561` (drone 2) in the correct MAVProxy console. Does not survive reboots |
+| MAVROS `connected: false` — drone 2 sees system ID 1 | `output add` was run in drone 1's MAVProxy by mistake. Remove it there, add in drone 2's |
+| No "EKF3 is using external nav" after param switch | Message only appears once per EKF init. If params are set and vision_pose is flowing, it's working — verify with stable hover after GPS off |
+| `PreArm: VisOdom: not healthy` oscillating | Normal at ~1.5 Hz — the 300ms health check timeout causes oscillation. Arm with GPS first (VISO_TYPE 0), switch mid-flight |
