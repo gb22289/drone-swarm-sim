@@ -1,331 +1,74 @@
-# GPS-Denied Drone Swarm Simulation
-## LiDAR-Inertial Odometry with ArduCopter SITL + Gazebo Harmonic + ROS2 Humble
+# README Updates — Deskew Relay + Attack Infrastructure
+
+These are the specific changes to make to your existing README.
 
 ---
 
-## System Requirements
+## Changes to Section 7: ros_gz Bridge Config
 
-- Ubuntu 22.04 LTS (Jammy) — **do not upgrade to 24.04**
-- Gazebo Sim 8.x (Harmonic)
-- ArduCopter SITL
-- ROS2 Humble
-- ARM64 or x86_64
-
----
-
-## 1. ArduPilot SITL + Gazebo Setup
-
-Assumes `ardupilot` and `ardupilot_gazebo` are cloned under `~/sim/`.
-
-### Launch Gazebo (warehouse world recommended for SLAM)
-
-```bash
-cd ~/sim/ardupilot_gazebo
-gz sim worlds/iris_warehouse.sdf -r
-```
-
-> The `-r` flag auto-runs the simulation. Without it, sensors won't publish.
-
-### Launch SITL (in a separate terminal, after Gazebo is fully loaded)
-
-```bash
-cd ~/sim/ardupilot/ArduCopter
-sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console
-```
-
----
-
-## 2. ArduPilot Parameter Configuration
-
-Run these in MAVProxy after SITL connects:
-
-```bash
-# Disable GPS
-param set GPS1_TYPE 0
-param set GPS2_TYPE 0
-
-# EKF3 — use External Nav (LIO-SAM) as position source
-param set EK3_SRC1_POSXY 6
-param set EK3_SRC1_VELXY 6
-param set EK3_SRC1_POSZ 1        # barometer for altitude
-param set EK3_SRC1_YAW 1         # compass for yaw
-param set EK3_SRC1_VELZ 0
-
-# Enable EKF3
-param set AHRS_EKF_TYPE 3
-param set EK3_ENABLE 1
-param set EK3_POSNE_M_NSE 0.1
-
-# Enable Visual Odometry input
-param set VISO_TYPE 1
-
-# Save
-param save nav.parm
-```
-
-> **Note:** On first boot, temporarily re-enable GPS to arm and take off
-> (`GPS1_TYPE 1`, `EK3_SRC1_POSXY 3`, `EK3_SRC1_VELXY 3`), let LIO-SAM
-> initialize, then switch back to external nav mid-flight.
-
----
-
-## 3. ROS2 Humble Installation
-
-```bash
-sudo apt update && sudo apt install -y software-properties-common curl
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-  -o /usr/share/keyrings/ros-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-  http://packages.ros.org/ros2/ubuntu jammy main" | \
-  sudo tee /etc/apt/sources.list.d/ros2.list
-
-sudo apt update
-sudo apt install -y ros-humble-desktop
-sudo apt install -y ros-humble-mavros ros-humble-mavros-extras
-
-# GeographicLib datasets (required by MAVROS)
-sudo wget https://raw.githubusercontent.com/mavlink/mavros/master/mavros/scripts/install_geographiclib_datasets.sh
-sudo bash install_geographiclib_datasets.sh
-
-# Add to .bashrc
-echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
-source ~/.bashrc
-```
-
----
-
-## 4. ros_gz Bridge (Gazebo Harmonic ↔ ROS2 Humble)
-
-Build from source (binary package not available for this combination):
-
-```bash
-source /opt/ros/humble/setup.bash
-sudo apt install -y python3-colcon-common-extensions python3-rosdep
-mkdir -p ~/ros2_ws/src
-cd ~/ros2_ws/src
-git clone https://github.com/gazebosim/ros_gz.git -b humble
-cd ~/ros2_ws
-export GZ_VERSION=harmonic
-sudo rosdep init && rosdep update
-rosdep install -r --from-paths src -i -y --rosdistro humble
-colcon build --cmake-args -DBUILD_TESTING=OFF
-echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
-source ~/.bashrc
-```
-
----
-
-## 5. LIO-SAM Installation
-
-```bash
-sudo apt install -y libeigen3-dev libpcl-dev ros-humble-pcl-ros \
-  ros-humble-pcl-conversions ros-humble-perception-pcl \
-  ros-humble-vision-opencv ros-humble-xacro
-
-# GTSAM
-sudo add-apt-repository ppa:borglab/gtsam-release-4.1
-sudo apt update && sudo apt install -y libgtsam-dev libgtsam-unstable-dev
-
-# Clone and build
-cd ~/ros2_ws/src
-git clone https://github.com/TixiaoShan/LIO-SAM.git -b ros2
-cd ~/ros2_ws
-colcon build --packages-select lio_sam --cmake-args -DBUILD_TESTING=OFF
-source install/setup.bash
-```
-
-### LIO-SAM Configuration (`~/ros2_ws/src/LIO-SAM/config/params.yaml`)
-
-Key values to set:
+Replace the bridge.yaml content with (note `points_raw` for LiDAR):
 
 ```yaml
-pointCloudTopic: "/lidar/points"
-imuTopic: "/imu/data"
-sensor: velodyne
-N_SCAN: 16
-Horizon_SCAN: 1800
-lidarMinRange: 0.1
-lidarMaxRange: 100.0
-imuType: 0
-imuRate: 100.0
-
-lidarFrame: "lidar_link"
-baselinkFrame: "base_link"
-odometryFrame: "odom"
-mapFrame: "map"
-
-extrinsicTrans: [0.0, 0.0, 0.0]
-extrinsicRot: [1.0, 0.0, 0.0,
-               0.0, 1.0, 0.0,
-               0.0, 0.0, 1.0]
-extrinsicRPY: [1.0, 0.0, 0.0,
-               0.0, 1.0, 0.0,
-               0.0, 0.0, 1.0]
-```
-
----
-
-## 6. VLP-16 LiDAR Sensor (Gazebo Model)
-
-> ⚠️ Add the LiDAR block to **`iris_with_standoffs/model.sdf`**, NOT `iris_with_gimbal/model.sdf`.
-> `iris_with_standoffs` is the nested sub-model that contains `base_link`. Adding it to `iris_with_gimbal` causes a naming collision and the sensor never fires.
-
-Add before the final `</model>` in `~/sim/ardupilot_gazebo/models/iris_with_standoffs/model.sdf`:
-
-```xml
-<!-- VLP-16 LiDAR -->
-<link name="lidar_link">
-  <pose>0 0 0.1 0 0 0</pose>
-  <inertial>
-    <mass>0.1</mass>
-    <inertia>
-      <ixx>0.000166667</ixx>
-      <iyy>0.000166667</iyy>
-      <izz>0.000166667</izz>
-    </inertia>
-  </inertial>
-  <sensor name="lidar" type="gpu_lidar">
-    <pose>0 0 0 0 0 0</pose>
-    <topic>/lidar/points</topic>
-    <gz_frame_id>lidar_link</gz_frame_id>
-    <update_rate>2</update_rate>
-    <lidar>
-      <scan>
-        <horizontal>
-          <samples>1800</samples>
-          <resolution>1</resolution>
-          <min_angle>-3.14159265</min_angle>
-          <max_angle>3.14159265</max_angle>
-        </horizontal>
-        <vertical>
-          <samples>16</samples>
-          <resolution>1</resolution>
-          <min_angle>-0.261799</min_angle>
-          <max_angle>0.261799</max_angle>
-        </vertical>
-      </scan>
-      <range>
-        <min>0.1</min>
-        <max>100.0</max>
-        <resolution>0.001</resolution>
-      </range>
-      <noise>
-        <type>gaussian</type>
-        <mean>0.0</mean>
-        <stddev>0.01</stddev>
-      </noise>
-    </lidar>
-    <always_on>1</always_on>
-    <visualize>true</visualize>
-  </sensor>
-</link>
-<joint name="lidar_joint" type="fixed">
-  <parent>base_link</parent>
-  <child>lidar_link</child>
-</joint>
-```
-
-> **Sensor type must be `gpu_lidar`** — Gazebo Harmonic (gz-sensors 8.x) dropped the CPU `lidar` type. Using `type="lidar"` will register the sensor in the scene but it will never publish data.
-
-> `update_rate` is set to 2 Hz due to ARM64 CPU performance limits.
-
-Verify the sensor is publishing after launch:
-
-```bash
-gz topic -e -t /lidar/points/points --duration 5   # should stream binary data
-ros2 topic hz /lidar/points                         # should show ~2 Hz
-```
-
----
-
-## 7. ros_gz Bridge Config
-
-Create `~/ros2_ws/bridge.yaml`:
-
-```yaml
-- ros_topic_name: "/lidar/points"
-  gz_topic_name: "/lidar/points/points"
+- ros_topic_name: "/drone1/lidar/points_raw"
+  gz_topic_name: "/drone1/lidar/points/points"
   ros_type_name: "sensor_msgs/msg/PointCloud2"
   gz_type_name: "gz.msgs.PointCloudPacked"
   direction: GZ_TO_ROS
 
-- ros_topic_name: "/imu/data"
+- ros_topic_name: "/drone1/imu/data"
   gz_topic_name: "/world/iris_warehouse/model/iris_with_gimbal/model/iris_with_standoffs/link/imu_link/sensor/imu_sensor/imu"
   ros_type_name: "sensor_msgs/msg/Imu"
   gz_type_name: "gz.msgs.IMU"
   direction: GZ_TO_ROS
 ```
 
-> If using `iris_runway` world, change `iris_warehouse` to `iris_runway` in the IMU topic path.
+> The LiDAR topic is renamed to `points_raw` so the deskew relay (Section 7b) can add per-point timestamps before LIO-SAM receives the data. Without this, LIO-SAM cannot deskew the scans and the map becomes streaky over time.
 
 ---
 
-## 8. LIO-SAM → MAVROS Bridge Node
+## NEW Section 7b: LiDAR Deskew Relay
 
-Save as `~/ros2_ws/src/lio_mavros_bridge.py`:
+The Gazebo VLP-16 bridge publishes PointCloud2 without a per-point `time` field. LIO-SAM requires this field for motion deskewing — correcting for the drone's movement during each LiDAR sweep. Without it, LIO-SAM prints `Point cloud timestamp not available, deskew function disabled` and the map accumulates registration errors.
 
-```python
-#!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PoseStamped
+The deskew relay sits between the bridge and LIO-SAM:
 
-class LioMavrosBridge(Node):
-    def __init__(self):
-        super().__init__('lio_mavros_bridge')
-        self.sub = self.create_subscription(
-            Odometry,
-            '/lio_sam/mapping/odometry',
-            self.odom_callback,
-            qos_profile_sensor_data)
-        self.pub = self.create_publisher(
-            PoseStamped,
-            '/mavros/vision_pose/pose',
-            10)
-        self.get_logger().info('LIO-SAM → MAVROS bridge started')
+```
+Bridge → /droneX/lidar/points_raw → [deskew relay adds 'time'] → /droneX/lidar/points → LIO-SAM
+```
 
-    def odom_callback(self, msg):
-        pose_msg = PoseStamped()
-        pose_msg.header.stamp = msg.header.stamp
-        pose_msg.header.frame_id = 'map'
-        pose_msg.pose = msg.pose.pose
-        self.pub.publish(pose_msg)
+The relay adds a synthetic `time` field to each scan based on ring number (VLP-16 vertical beam index), distributing timestamps from 0 to 0.1s across the sweep. This is part of the `swarm_mission` package.
 
-def main():
-    rclpy.init()
-    node = LioMavrosBridge()
-    rclpy.spin(node)
-    rclpy.shutdown()
+```bash
+# Build (if not already built)
+cd ~/ros2_ws && colcon build --packages-select swarm_mission && source install/setup.bash
 
-if __name__ == '__main__':
-    main()
+# Run for each drone (in separate terminals, BEFORE LIO-SAM)
+ros2 run swarm_mission lidar_deskew_relay --ros-args -p drone_ns:=drone1
+ros2 run swarm_mission lidar_deskew_relay --ros-args -p drone_ns:=drone2
+```
+
+Verify the relay is working:
+
+```bash
+# Raw from bridge (no 'time' field)
+ros2 topic echo /drone1/lidar/points_raw --field fields --once
+
+# After relay (should include 'time' field)
+ros2 topic echo /drone1/lidar/points --field fields --once
+
+# Rate should match
+ros2 topic hz /drone1/lidar/points      # ~2 Hz
+ros2 topic hz /drone1/lidar/points_raw   # ~2 Hz
 ```
 
 ---
 
-## 9. Two-Drone World Setup
+## Changes to Section 9: Two-Drone World Setup
 
-Before launching two drones, you need a second iris model spawned at a different position in the warehouse. The easiest approach is to add a second model include directly in the world SDF.
-
-Edit `~/sim/ardupilot_gazebo/worlds/iris_warehouse.sdf` and add a second drone inside the `<world>` tag (after the first drone's `<include>` block):
-
-```xml
-<!-- Drone 2 — offset 3m on Y axis so they don't overlap -->
-<include>
-  <uri>model://iris_with_gimbal</uri>
-  <name>iris_with_gimbal_2</name>
-  <pose>0 3 0.2 0 0 0</pose>
-</include>
-```
-
-> Each drone needs a unique `<name>` — this is what Gazebo uses to namespace its sensor topics. Drone 2's LiDAR will publish to `/drone2/lidar/points/points` and its IMU to the equivalent path. Verify after launch with `gz topic -l | grep iris_with_gimbal_2`.
-
-Also create a second bridge config at `~/ros2_ws/bridge2.yaml`:
+Replace the bridge2.yaml content with (note `points_raw` for LiDAR):
 
 ```yaml
-- ros_topic_name: "/drone2/lidar/points"
+- ros_topic_name: "/drone2/lidar/points_raw"
   gz_topic_name: "/drone2/lidar/points/points"
   ros_type_name: "sensor_msgs/msg/PointCloud2"
   gz_type_name: "gz.msgs.PointCloudPacked"
@@ -338,123 +81,13 @@ Also create a second bridge config at `~/ros2_ws/bridge2.yaml`:
   direction: GZ_TO_ROS
 ```
 
-> Check the exact Gazebo IMU topic path for drone 2 with: `gz topic -l | grep imu | grep gimbal_2`
-
 ---
 
-## 10. Full Startup Order — Single Drone
+## Changes to Section 11: Full Startup Order — Two Drones
 
-Run each in a separate terminal in this exact order:
-
-```bash
-# Terminal 1 — Gazebo
-cd ~/sim/ardupilot_gazebo
-gz sim worlds/iris_warehouse.sdf -r
-
-# Terminal 2 — SITL drone 1 (wait for Gazebo to fully load first)
-cd ~/sim/ardupilot/ArduCopter
-sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
-
-# --- In Drone 1 MAVProxy console, add localhost output for MAVROS ---
-#   output add 127.0.0.1:14551
-
-# Terminal 3 — ros_gz bridge (drone 1)
-source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
-ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
-
-# Terminal 4 — MAVROS (drone 1, port 14551)
-source /opt/ros/humble/setup.bash
-ros2 launch mavros apm.launch fcu_url:=udp://:14551@localhost \
-  tgt_system:=1 \
-  config_yaml:=$HOME/ros2_ws/mavros_drone1.yaml
-
-# Terminal 5 — LIO-SAM (drone 1)
-source ~/ros2_ws/install/setup.bash
-ros2 launch lio_sam run.launch.py \
-  params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone1.yaml \
-  namespace:=drone1
-
-# Terminal 6 — LIO-SAM → MAVROS bridge (drone 1)
-source ~/ros2_ws/install/setup.bash
-python3 ~/ros2_ws/src/lio_mavros_bridge.py
-```
-
----
-
-## 11. Full Startup Order — Two Drones
-
-Requires the two-drone world SDF setup from Section 9. Each drone needs its own SITL instance, bridge, MAVROS, static TF publishers, LIO-SAM, and bridge node — all namespaced separately.
-
-### Namespace Architecture
-
-| Component | Drone 1 | Drone 2 |
-|---|---|---|
-| LiDAR topic | `/drone1/lidar/points` | `/drone2/lidar/points` |
-| IMU topic | `/drone1/imu/data` | `/drone2/imu/data` |
-| Odometry | `/drone1/lio_sam/mapping/odometry_incremental` | `/drone2/lio_sam/mapping/odometry_incremental` |
-| Vision pose | `/drone1/mavros/vision_pose/pose` | `/drone2/mavros/vision_pose/pose` |
-| MAVROS state | `/mavros/state` | `/drone2/mavros/state` |
-| SITL port (MAVROS) | 14551 | 14561 |
-| MAV_SYSID | 1 (default) | **2** (must set manually) |
-| TF base frame | `drone1/base_link` | `drone2/base_link` |
-| TF lidar frame | `drone1/lidar_link` | `drone2/lidar_link` |
-
-### One-time config (run once, not every launch)
+Add these new terminals between the bridge and LIO-SAM steps:
 
 ```bash
-cat > ~/ros2_ws/mavros_drone1.yaml << 'EOF'
-/**:
-  ros__parameters:
-    tf_prefix: "drone1"
-    use_sim_time: true
-EOF
-
-cat > ~/ros2_ws/mavros_drone2.yaml << 'EOF'
-/**:
-  ros__parameters:
-    tf_prefix: "drone2"
-    use_sim_time: true
-EOF
-```
-
-### Launch sequence
-
-```bash
-# Terminal 1 — Gazebo (loads both drone models)
-cd ~/sim/ardupilot_gazebo
-gz sim worlds/iris_warehouse.sdf -r
-
-# Terminal 2 — SITL drone 1 (instance 0, ports 14550/14551)
-cd ~/sim/ardupilot/ArduCopter
-sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
-
-# Terminal 3 — SITL drone 2 (instance 1, ports 14560/14561)
-cd ~/sim/ardupilot/ArduCopter
-sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console -I1
-
-# --- MAVProxy output + system ID setup (run in each MAVProxy console) ---
-# IMPORTANT: sim_vehicle.py only forwards MAVLink to the Windows host IP.
-# MAVROS runs inside WSL and needs a localhost output. Run these BEFORE
-# launching MAVROS, in the correct MAVProxy console for each drone.
-#
-# Drone 1 MAVProxy console (--map --console window):
-#   output add 127.0.0.1:14551
-#
-# Drone 2 MAVProxy console (-I1 window):
-#   output add 127.0.0.1:14561
-#   param set MAV_SYSID 2
-#   param save
-#
-# MAV_SYSID: Both SITL instances default to system ID 1. Drone 2's MAVROS
-# uses tgt_system:=2, so it will ignore packets from system 1. You MUST
-# set MAV_SYSID to 2 on drone 2's SITL. The "Failed to set" warning is
-# normal — the system ID change confuses MAVProxy, but it takes effect.
-# MAV_SYSID survives param save, so you only need to set it once.
-#
-# Verify with: output  (lists all active outputs)
-# NOTE: output add does NOT survive SITL reboots. Re-add after every reboot.
-# NOTE: MAV_SYSID DOES survive reboots (saved to eeprom).
-
 # Terminal 4 — ros_gz bridge drone 1
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
@@ -463,561 +96,129 @@ ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge2.yaml
 
+# Terminal 5a — Deskew relay drone 1 (NEW — run BEFORE LIO-SAM)
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission lidar_deskew_relay --ros-args -p drone_ns:=drone1
+
+# Terminal 5b — Deskew relay drone 2 (NEW — run BEFORE LIO-SAM)
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission lidar_deskew_relay --ros-args -p drone_ns:=drone2
+
 # Terminal 6 — MAVROS drone 1 (port 14551)
-source /opt/ros/humble/setup.bash
-ros2 launch mavros apm.launch \
-  fcu_url:=udp://:14551@localhost \
-  tgt_system:=1 \
-  config_yaml:=$HOME/ros2_ws/mavros_drone1.yaml
+# ... (unchanged)
 
-# Terminal 7 — MAVROS drone 2 (port 14561)
-source /opt/ros/humble/setup.bash
-ros2 launch mavros apm.launch \
-  fcu_url:=udp://:14561@localhost \
-  tgt_system:=2 \
-  namespace:=drone2/mavros \
-  config_yaml:=$HOME/ros2_ws/mavros_drone2.yaml
-
-# Terminal 8 — Static TF drone 1
-source /opt/ros/humble/setup.bash
-ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 base_link drone1/base_link &
-ros2 run tf2_ros static_transform_publisher 0 0 0.1 0 0 0 drone1/base_link drone1/lidar_link
-
-# Terminal 9 — Static TF drone 2
-source /opt/ros/humble/setup.bash
-ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 base_link drone2/base_link &
-ros2 run tf2_ros static_transform_publisher 0 0 0.1 0 0 0 drone2/base_link drone2/lidar_link
-
-# Terminal 10 — LIO-SAM drone 1
-# IMPORTANT: Use namespace:= argument to run.launch.py (NOT PushRosNamespace).
-# LIO-SAM's run.launch.py sets namespace= on each Node directly, which
-# overrides PushRosNamespace. Without this, both drones' LIO-SAM nodes
-# collide in the root namespace and crash.
-source ~/ros2_ws/install/setup.bash
-ros2 launch lio_sam run.launch.py \
-  params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone1.yaml \
-  namespace:=drone1
-
-# Terminal 11 — LIO-SAM drone 2
-source ~/ros2_ws/install/setup.bash
-ros2 launch lio_sam run.launch.py \
-  params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone2.yaml \
-  namespace:=drone2
-
-# Terminal 12 — LIO-SAM → MAVROS bridge drone 1
-# IMPORTANT: MAVROS drone1 may subscribe on /mavros/vision_pose/pose (no drone1/
-# prefix) even when launched with ros_namespace. The remap below fixes this.
-# Verify with: ros2 topic info /mavros/vision_pose/pose (Subscription count: 1)
-source ~/ros2_ws/install/setup.bash
-python3 ~/ros2_ws/src/lio_mavros_bridge.py --ros-args \
-  -p drone_ns:=drone1 \
-  -r /drone1/mavros/vision_pose/pose:=/mavros/vision_pose/pose
-
-# Terminal 13 — LIO-SAM → MAVROS bridge drone 2
-source ~/ros2_ws/install/setup.bash
-python3 ~/ros2_ws/src/lio_mavros_bridge.py --ros-args -p drone_ns:=drone2
+# Terminal 10 — LIO-SAM drone 1 (unchanged — still reads /drone1/lidar/points)
+# Terminal 11 — LIO-SAM drone 2 (unchanged — still reads /drone2/lidar/points)
 ```
 
-### Verify both drones are up
-
-```bash
-# Sensors flowing
-ros2 topic hz /drone1/lidar/points          # ~2Hz
-ros2 topic hz /drone2/lidar/points          # ~2Hz
-ros2 topic hz /drone1/imu/data              # ~1000Hz
-ros2 topic hz /drone2/imu/data              # ~1000Hz
-
-# LIO-SAM nodes properly namespaced (CRITICAL check)
-ros2 node list | grep lio
-# Should show /drone1/lio_sam_* and /drone2/lio_sam_*
-# If you see bare /lio_sam_* without prefix, namespace arg was not passed
-
-# MAVROS connected (run after param fetch responds in each MAVProxy console)
-ros2 topic echo /mavros/state --once        # connected: true
-ros2 topic echo /drone2/mavros/state --once # connected: true
-
-# Vision pose reaching MAVROS (both Publisher and Subscription count must be >= 1)
-ros2 topic info /mavros/vision_pose/pose
-ros2 topic info /drone2/mavros/vision_pose/pose
-
-# Odometry publishing (only after drones are airborne and moving)
-ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental
-ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental
-```
-
-> **MAVProxy note:** Each SITL instance opens its own MAVProxy console. Drone 1 is on the window that launched with `--map --console`. Drone 2's console is the plain window from `-I1`. Run bootstrap and parameter commands in the correct window for each drone.
-
-> **MAVROS connected: false** is normal immediately after launch — wait a few seconds for the heartbeat. If it stays `connected: false`, check: (1) you ran `output add 127.0.0.1:14551` / `14561` in the correct MAVProxy console, (2) MAVROS is using port 14551/14561 not 14550/14560, (3) the output was added in the right drone's MAVProxy (check with `output` command — drone 2's MAVROS seeing system ID 1 means the output was added in drone 1's console by mistake).
+> **Launch order matters:** The deskew relay must be running before LIO-SAM starts, otherwise LIO-SAM receives raw scans without the `time` field and disables deskewing. If you see the deskew warning, restart LIO-SAM (the relay can stay running).
 
 ---
 
-## 12. GPS-Denied Bootstrap Procedure
+## Changes to Section 15: Waypoints
 
-Since LIO-SAM needs motion to initialize, use GPS briefly to get airborne. Run these commands in **each drone's MAVProxy console** separately. Always run `param fetch` first and wait for it to respond before setting parameters.
+The waypoints.yaml now uses 18 waypoints (9 per drone) with zones split along the x-axis:
 
-### Step 1 — Enable GPS and take off (both drones)
+- **Drone 1 (IDs 0-8):** Open area, world x = -8 to -13
+- **Drone 2 (IDs 9-17):** Shelving area, world x = 1 to 9
 
-```bash
-# Run in Drone 1 MAVProxy (--map --console window)
-param fetch
-param set GPS1_TYPE 1
-param set EK3_SRC1_POSXY 3
-param set EK3_SRC1_VELXY 3
-param set EK3_SRC1_YAW 1
-param set VISO_TYPE 0
-mode guided
-arm throttle
-takeoff 3
-```
-
-```bash
-# Run in Drone 2 MAVProxy (-I1 window) — same commands
-param fetch
-param set GPS1_TYPE 1
-param set EK3_SRC1_POSXY 3
-param set EK3_SRC1_VELXY 3
-param set EK3_SRC1_YAW 1
-param set VISO_TYPE 0
-mode guided
-arm throttle
-takeoff 3
-```
-
-### Step 2 — Wait for LIO-SAM to initialize
-
-In a separate terminal, watch for odometry to appear:
-
-```bash
-ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental
-ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental
-```
-
-Both should start publishing within a few seconds of the drones moving. Also verify vision_pose is reaching MAVROS:
-
-```bash
-ros2 topic hz /mavros/vision_pose/pose              # ~1.5Hz
-ros2 topic hz /drone2/mavros/vision_pose/pose       # ~1.5Hz
-```
-
-### Step 3 — Switch to LIO-SAM nav (both drones)
-
-Once odometry is publishing **and** `ros2 topic hz /mavros/vision_pose/pose` shows ~1.5 Hz, run in **each** MAVProxy console:
-
-```bash
-param set VISO_DELAY_MS 50
-param set EK3_SRC1_POSXY 6
-param set EK3_SRC1_VELXY 6
-param set EK3_SRC1_VELZ 0
-param set EK3_SRC1_YAW 6
-param set GPS1_TYPE 0
-param set VISO_TYPE 1
-```
-
-> `VISO_DELAY_MS 50` tells the EKF the expected latency of vision data. `EK3_SRC1_VELZ 0` disables GPS velocity Z (since GPS is now off). You should see **"EKF3 IMU0 is using external nav data"** in the MAVProxy console — this message only appears once per EKF initialization.
-
-### Step 4 — Verify full pipeline
-
-```bash
-ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental  # publishing
-ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental  # publishing
-ros2 topic hz /drone1/mavros/vision_pose/pose               # ~2Hz
-ros2 topic hz /drone2/mavros/vision_pose/pose               # ~2Hz
-ros2 topic echo /mavros/state --once                        # armed: true, guided: true
-ros2 topic echo /drone2/mavros/state --once                 # armed: true, guided: true
-```
-
-> **Note:** The "Large velocity, reset IMU-preintegration" warning appears periodically due to Gazebo clock synchronisation artefacts from running two SITL instances. This is a known simulation limitation — LIO-SAM self-corrects within ~1 second. Document this in methodology as: *"periodic clock sync artefacts cause brief (~1s) IMU resets at ~30s intervals; measurements taken during stable inter-reset windows."*
+Coordinate conversion reminder: `local = world - spawn`
+- Drone 1 spawn (-6, 0): world x=-10 → local x=-4 (backward into open area)
+- Drone 2 spawn (-3, 0): world x=6 → local x=9 (forward into shelves)
 
 ---
 
-## 13. Gazebo Clock Patches for LIO-SAM
+## NEW Section 16: Layer 2 Attacks — Navigation Pipeline
 
-Two SITL instances competing for the Gazebo physics timestep cause periodic ~0.8s backward clock jumps. These corrupt LIO-SAM's IMU preintegration, causing `gtsam::IndeterminantLinearSystemException` crashes. The following patches are **required** for stable multi-drone simulation.
+### Point Cloud Injection (pointcloud_injector.py)
 
-### Patch 1: IMU dt guards (`imuPreintegration.cpp`)
-
-Three places where `double dt = ...` is computed. After each, add guards:
-
-**Location A — optimization IMU loop (~line 392):**
-```cpp
-double dt = (lastImuT_opt < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_opt);
-if (dt <= 0.0) { lastImuT_opt = imuTime; continue; }  // ← ADD
-if (dt > 0.02) dt = 0.02;                               // ← ADD
-```
-
-**Location B — IMU queue replay loop (~line 461):**
-```cpp
-double dt = (lastImuQT < 0) ? (1.0 / 500.0) :(imuTime - lastImuQT);
-if (dt <= 0.0) { lastImuQT = imuTime; continue; }  // ← ADD
-if (dt > 0.02) dt = 0.02;                            // ← ADD
-```
-
-**Location C — imuHandler callback (~line 507):**
-```cpp
-double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);
-if (dt <= 0.0) { lastImuT_imu = imuTime; return; }  // ← ADD (return, not continue)
-if (dt > 0.02) dt = 0.02;                             // ← ADD
-```
-
-> **Why 0.02?** A 0.8s forward jump integrates gravity: 9.8 × 0.8 = 7.84 m/s. After 4 jumps → exceeds 30 m/s threshold → "Large velocity" reset → GTSAM crash.
-
-### Patch 2: Odometry correction guard (`imuPreintegration.cpp`)
-
-**Add member variable** near `lastImuT_imu` (~line 211):
-```cpp
-double lastImuT_imu = -1;
-double lastCorrectionTime = -1;   // ← ADD
-```
-
-**Add guard** in `odometryHandler()` after `currentCorrectionTime`:
-```cpp
-double currentCorrectionTime = stamp2Sec(odomMsg->header.stamp);
-if (currentCorrectionTime <= lastCorrectionTime) return;  // ← ADD
-lastCorrectionTime = currentCorrectionTime;                // ← ADD
-```
-
-### Patch 3: IMU extrinsics for Gazebo
-
-Gazebo IMU uses NED (`z = -9.8` when level). LIO-SAM expects ENU (`z = +9.8`). `extrinsicRot` flips accel/gyro. `extrinsicRPY` must be **identity** — Gazebo orientation is already correct; flipping it makes LIO-SAM think the drone is upside down.
-
-In both `params_drone1.yaml` and `params_drone2.yaml`:
-```yaml
-extrinsicRot: [1.0,  0.0,  0.0,
-               0.0, -1.0,  0.0,
-               0.0,  0.0, -1.0]
-extrinsicRPY: [1.0, 0.0, 0.0,
-               0.0, 1.0, 0.0,
-               0.0, 0.0, 1.0]
-```
-
-### Patch 4: Feature thresholds for indoor environments
-
-```yaml
-edgeThreshold: 0.5              # default 1.0
-edgeFeatureMinValidNum: 2       # default 10
-surfFeatureMinValidNum: 50      # default 100
-```
-
-### Patch 5: Sim time
-
-Must be inside the **single** `/**:  ros__parameters:` block:
-```yaml
-/**:
-  ros__parameters:
-    use_sim_time: true
-    # ... all other params
-```
-
-> **YAML pitfall:** Duplicate `/**:` blocks or duplicate `ros__parameters:` keys cause silent override — only the last survives.
-
-### Rebuild
+Publishes crafted PointCloud2 messages to the target drone's LiDAR topic, injecting false geometry (a phantom wall) into LIO-SAM's map.
 
 ```bash
-cd ~/ros2_ws && colcon build --packages-select lio_sam
-```
-
----
-
-## 14. Autonomous Navigation (GUIDED Mode Waypoints)
-
-Once the drone is airborne and LIO-SAM is active, you can command autonomous movement via MAVROS position setpoints. This is the foundation for the swarm attack experiments.
-
-### Quick test — send a single position command
-
-```bash
-# Confirm MAVROS is receiving pose estimates before sending commands
-ros2 topic echo /mavros/local_position/pose --once
-
-# Send a single position setpoint (x=5m, y=0, z=3m in local frame)
-ros2 topic pub --once /mavros/setpoint_position/local geometry_msgs/msg/PoseStamped \
-  "{header: {frame_id: 'map'}, pose: {position: {x: 5.0, y: 0.0, z: 3.0}, orientation: {w: 1.0}}}"
-```
-
-> The drone will only move if it is already in GUIDED mode and armed. Run `mode guided` in MAVProxy first.
-
-### Waypoint patrol script
-
-Save as `~/ros2_ws/src/waypoint_patrol.py` and run after the bootstrap procedure:
-
-```python
-#!/usr/bin/env python3
-"""
-Simple waypoint patrol for GPS-denied warehouse navigation.
-Requires: drone airborne, LIO-SAM active, MAVROS connected.
-Run: python3 waypoint_patrol.py
-"""
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
-from mavros_msgs.srv import CommandBool, SetMode
-from mavros_msgs.msg import State
-import time
-
-# Waypoints as (x, y, z) in metres — local ENU frame
-# Adjust to match your warehouse layout
-WAYPOINTS = [
-    ( 5.0,  0.0, 3.0),
-    ( 5.0,  5.0, 3.0),
-    ( 0.0,  5.0, 3.0),
-    ( 0.0,  0.0, 3.0),
-]
-
-HOLD_TIME = 5.0      # seconds to hold at each waypoint
-TOLERANCE = 0.5      # metres — how close counts as "reached"
-
-class WaypointPatrol(Node):
-    def __init__(self):
-        super().__init__('waypoint_patrol')
-        self.state = State()
-        self.current_pose = PoseStamped()
-
-        self.state_sub = self.create_subscription(
-            State, '/mavros/state', self.state_cb, 10)
-        self.pose_sub = self.create_subscription(
-            PoseStamped, '/mavros/local_position/pose', self.pose_cb, 10)
-        self.setpoint_pub = self.create_publisher(
-            PoseStamped, '/mavros/setpoint_position/local', 10)
-
-        self.set_mode_cli = self.create_client(SetMode, '/mavros/set_mode')
-        self.arming_cli  = self.create_client(CommandBool, '/mavros/cmd/arming')
-
-        self.get_logger().info('Waypoint patrol node started')
-
-    def state_cb(self, msg):
-        self.state = msg
-
-    def pose_cb(self, msg):
-        self.current_pose = msg
-
-    def distance_to(self, x, y, z):
-        p = self.current_pose.pose.position
-        return ((p.x - x)**2 + (p.y - y)**2 + (p.z - z)**2) ** 0.5
-
-    def send_setpoint(self, x, y, z):
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'map'
-        msg.pose.position.x = x
-        msg.pose.position.y = y
-        msg.pose.position.z = z
-        msg.pose.orientation.w = 1.0
-        self.setpoint_pub.publish(msg)
-
-    def run_patrol(self):
-        self.get_logger().info('Starting patrol...')
-        for i, (x, y, z) in enumerate(WAYPOINTS):
-            self.get_logger().info(f'Heading to waypoint {i+1}: ({x}, {y}, {z})')
-            while self.distance_to(x, y, z) > TOLERANCE:
-                self.send_setpoint(x, y, z)
-                time.sleep(0.1)
-                rclpy.spin_once(self, timeout_sec=0)
-            self.get_logger().info(f'Reached waypoint {i+1} — holding {HOLD_TIME}s')
-            hold_end = time.time() + HOLD_TIME
-            while time.time() < hold_end:
-                self.send_setpoint(x, y, z)
-                time.sleep(0.1)
-                rclpy.spin_once(self, timeout_sec=0)
-        self.get_logger().info('Patrol complete')
-
-def main():
-    rclpy.init()
-    node = WaypointPatrol()
-    # Brief wait for connections
-    time.sleep(2.0)
-    node.run_patrol()
-    rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
-```
-
-Run it:
-
-```bash
-python3 ~/ros2_ws/src/waypoint_patrol.py
-```
-
-Monitor progress:
-
-```bash
-# Watch drone position update in real time
-ros2 topic echo /mavros/local_position/pose
-
-# Confirm LIO-SAM is still tracking during movement
-ros2 topic hz /lio_sam/mapping/odometry
-```
-
-> **If the drone doesn't move:** confirm it is in GUIDED mode (`mode guided` in MAVProxy) and that `/mavros/local_position/pose` is publishing. The drone must be receiving a continuous stream of setpoints — a single publish is not sufficient for GUIDED mode.
-
----
-
-## Architecture Overview
-
-```
-Gazebo Sim (iris_warehouse)
-    │
-    ├── VLP-16 LiDAR → /lidar/points/points (gz topic)
-    └── IMU sensor   → /world/.../imu (gz topic)
-           │
-      ros_gz_bridge
-           │
-    ├── /lidar/points  (sensor_msgs/PointCloud2)
-    └── /imu/data      (sensor_msgs/Imu)
-           │
-        LIO-SAM
-           │
-    /lio_sam/mapping/odometry
-           │
-    lio_mavros_bridge.py
-           │
-    /mavros/vision_pose/pose
-           │
-        MAVROS
-           │
-    ArduCopter SITL (EKF3 External Nav)
-           │
-    /mavros/setpoint_position/local  ← waypoint_patrol.py sends targets here
-```
-
----
-
-## 15. Cooperative Inspection Mission (Byzantine Fault Experiments)
-
-GPS-denied environments force drones to rely on cooperative data sharing — there is no external oracle to verify position claims. This mission exploits that trust dependency: drones divide a warehouse into waypoint zones, share completion status, and skip waypoints reported as visited by partners. A Byzantine drone can exploit this by falsely reporting coverage, leaving blind spots.
-
-### Install the mission package
-
-```bash
-cp -r ~/ros2_ws/src/swarm_mission ~/ros2_ws/src/
-cd ~/ros2_ws
-colcon build --packages-select swarm_mission
-source install/setup.bash
-```
-
-### Architecture
-
-```
-/swarm/waypoint_status   (std_msgs/String, JSON)
-    ^                         ^
-    |  publishes               |  publishes
-    |                         |
-[drone1/waypoint_navigator]  [drone2/waypoint_navigator]
-    |  subscribes              |  subscribes
-    v                         v
-/swarm/waypoint_status   (reads partner reports, skips covered waypoints)
-    |
-    v
-[ground_truth_logger]   (compares reports vs actual LIO-SAM positions)
-    |
-    v
-mission_results.csv     (thesis data: reported vs actual coverage)
-```
-
-Each drone reads its assigned waypoints from `config/waypoints.yaml`, flies to them via MAVROS setpoints, and publishes completion to the shared topic. The ground truth logger independently tracks drone positions from LIO-SAM odometry to verify what was actually visited.
-
-### Prerequisites before launching mission
-
-1. Both drones airborne via bootstrap procedure (Section 12)
-2. Both drones in **GUIDED mode** — run `mode guided` in both MAVProxy consoles
-3. Verify MAVROS local_position is publishing for both drones:
-   ```bash
-   ros2 topic hz /mavros/local_position/pose         # drone 1
-   ros2 topic hz /drone2/mavros/local_position/pose   # drone 2
-   ```
-
-### Key technical notes
-
-- **Setpoint rate:** ArduCopter GUIDED mode requires continuous setpoints at ≥10 Hz. The navigator uses a 20 Hz timer.
-- **Position source:** Navigator reads from MAVROS `local_position/pose` (EKF output frame), NOT LIO-SAM odometry. This ensures setpoints and position readings are in the same frame.
-- **Coordinate conversion:** Waypoints in `config/waypoints.yaml` are in Gazebo world coordinates. The navigator converts them to MAVROS local frame using spawn position offsets: `local = world - spawn`.
-- **Spawn positions:** Drone 1 spawns at (-6, 0), drone 2 at (-3, 0) in the warehouse SDF. These must be passed as parameters.
-- **No use_sim_time:** Do NOT pass `use_sim_time:=true` to the navigator nodes — it throttles the 20 Hz setpoint timer and ArduCopter stops responding.
-
-### Run — Honest scenario (baseline)
-
-After completing prerequisites above, run in separate terminals:
-
-```bash
-# Terminal 14 — Build (if not already built)
-cd ~/ros2_ws && colcon build --packages-select swarm_mission && source install/setup.bash
-
-# Terminal 15 — Drone 1 navigator
 source ~/ros2_ws/install/setup.bash
-ros2 run swarm_mission waypoint_navigator --ros-args \
-  -p drone_id:=drone1 -p byzantine:=false \
+ros2 run swarm_mission pointcloud_injector --ros-args \
+  -p target_drone:=drone1 \
+  -p wall_x:=-10.0 \
+  -p wall_y_min:=-5.0 -p wall_y_max:=3.0 \
+  -p wall_z_min:=0.0  -p wall_z_max:=3.5 \
   -p spawn_x:=-6.0 -p spawn_y:=0.0 \
-  -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
-
-# Terminal 16 — Drone 2 navigator
-source ~/ros2_ws/install/setup.bash
-ros2 run swarm_mission waypoint_navigator --ros-args \
-  -p drone_id:=drone2 -p byzantine:=false \
-  -p spawn_x:=-3.0 -p spawn_y:=0.0 \
-  -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
-
-# Terminal 17 — Ground truth logger
-source ~/ros2_ws/install/setup.bash
-ros2 run swarm_mission ground_truth_logger --ros-args \
-  -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
+  -p point_spacing:=0.15
 ```
 
-### Run — Byzantine scenario (drone 2 lies)
+**Parameters:**
 
-Same as above, but change drone 2's terminal to:
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| target_drone | drone1 | Which drone to attack |
+| wall_x | -10.0 | World X coordinate of the wall plane |
+| wall_y_min/max | -5.0 / 3.0 | Wall extent in Y |
+| wall_z_min/max | 0.0 / 3.5 | Wall extent in Z |
+| point_spacing | 0.15 | Metres between injected points |
+| spawn_x/y | -6.0 / 0.0 | Target drone's spawn position |
+| noise_sigma | 0.02 | Gaussian noise for realism |
+| injection_rate | 2.0 | Scans per second |
+
+**Topics:**
+
+| Drone | LiDAR topic (attack target) | Pose topic (for coordinate transform) |
+|-------|---------------------------|--------------------------------------|
+| drone1 | /drone1/lidar/points | /mavros/local_position/pose |
+| drone2 | /drone2/lidar/points | /drone2/mavros/local_position/pose |
+
+**Findings:** The phantom wall appears in the LIO-SAM point cloud map (visible in RViz) but does not cause significant odometry drift when published as separate scans. LIO-SAM's ICP scan matching + IMU preintegration prior are robust enough to absorb the additional geometry. The wall is accepted into the map as new features but does not bias the pose estimate. This is documented as a negative result — topic-level point cloud injection alone is insufficient to corrupt LIO-SAM's localisation when the real sensor data provides stronger geometric constraints.
+
+### QoS Profile Poisoning (qos_poisoner.py)
+
+Creates RELIABLE subscribers on LIO-SAM's BEST_EFFORT odometry topic, forcing the DDS middleware to satisfy the stricter QoS policy. This causes the odometry output rate to degrade, starving the vision pose bridge below ArduCopter's EKF3 minimum threshold (0.5 Hz), which triggers a Land Mode failsafe.
+
+**Attacker model:** Network participant that can SUBSCRIBE to any DDS topic (SROS2 disabled). No interception, modification, or reconfiguration of victim systems required.
+
+**How it works:**
+1. DDS publishers must satisfy ALL subscribers' QoS policies
+2. LIO-SAM publishes odometry as BEST_EFFORT (fire-and-forget, fast)
+3. The attacker creates RELIABLE subscribers, forcing buffering and acknowledgement
+4. The publisher slows down to satisfy the RELIABLE contract
+5. Downstream consumers (MAVROS vision_pose bridge) receive fewer messages
+6. ArduCopter's EKF3 detects the rate drop and triggers a failsafe
 
 ```bash
+# Automated attack with metric collection (3 phases: baseline → attack → recovery)
 source ~/ros2_ws/install/setup.bash
-ros2 run swarm_mission waypoint_navigator --ros-args \
-  -p drone_id:=drone2 -p byzantine:=true \
-  -p spawn_x:=-3.0 -p spawn_y:=0.0 \
-  -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
+ros2 run swarm_mission qos_poisoner --ros-args \
+  -p target_drone:=drone1 \
+  -p baseline_duration:=15.0 \
+  -p attack_duration:=45.0 \
+  -p recovery_duration:=15.0 \
+  -p num_reliable_subs:=5
 ```
 
-In Byzantine mode, drone 2 immediately reports all its assigned waypoints as visited without flying to them. Drone 1 sees these reports and skips them, believing full coverage was achieved. The ground truth logger records the gap.
+**Parameters:**
 
-### Expected thesis results
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| target_drone | drone1 | Which drone to attack |
+| baseline_duration | 15.0 | Seconds of pre-attack measurement |
+| attack_duration | 45.0 | Seconds with RELIABLE subscribers active |
+| recovery_duration | 15.0 | Seconds of post-attack measurement |
+| num_reliable_subs | 5 | Number of RELIABLE subscribers to create |
+| rate_window | 3.0 | Sliding window (s) for Hz calculation |
+| output_dir | ~ | Directory for CSV output |
 
-| Scenario | Reported coverage | Actual coverage | Coverage gap |
-|---|---|---|---|
-| Honest (baseline) | 12/12 (100%) | 12/12 (100%) | 0 |
-| Byzantine (drone 2) | 12/12 (100%) | 6/12 (50%) | 6 waypoints |
+**Output:** The node automatically collects metrics and saves to `~/qos_attack_metrics_<drone>_<timestamp>.csv` with columns: timestamp, phase, phase_elapsed_s, vision_pose_hz, odom_hz.
 
-Results are appended to `~/ros2_ws/mission_results.csv` with per-waypoint breakdown and timestamps.
+**Manual attack (single command, no metrics):**
 
-### Waypoint configuration
+```bash
+# This alone can trigger the attack — just subscribe with RELIABLE QoS
+ros2 topic echo /drone1/lio_sam/mapping/odometry_incremental --qos-reliability reliable
+```
 
-Edit `config/waypoints.yaml` to adjust the 4x3 grid of 12 waypoints covering the warehouse. Zone assignments control which drone is responsible for which waypoints.
+**Metrics to collect:**
 
----
-
-## Troubleshooting
-
-| Issue | Fix |
-|---|---|
-| `gtsam::IndeterminantLinearSystemException` crash | Apply clock jump patches from Section 13 and rebuild |
-| `PreArm: VisOdom: not healthy` | LIO-SAM not publishing — use GPS bootstrap procedure |
-| `AHRS: waiting for home` | GPS not locked — restart SITL after setting `GPS1_TYPE 1` |
-| `EKF3 IMU stopped aiding` | Re-enable compass: `COMPASS_ENABLE 1`, `EK3_SRC1_YAW 1` |
-| `param set` Unknown setting | Run `param fetch` first to refresh cache |
-| LiDAR not in ROS2 | Check bridge is running after Gazebo loads; verify gz topic is `/lidar/points/points` |
-| LIO-SAM no odometry on flat ground | Switch to warehouse world — runway is too featureless for SLAM |
-| `ros-humble-ros-gzharmonic` not found | Build ros_gz from source with `GZ_VERSION=harmonic` |
-| LiDAR sensor registered but zero messages | Ensure `type="gpu_lidar"` in model SDF — `type="lidar"` is not supported in Gazebo Harmonic |
-| LiDAR link renamed to `lidar_link(1)` | LiDAR block is in wrong model file — must be in `iris_with_standoffs`, not `iris_with_gimbal` |
-| Drone ignores setpoint commands | Must be in GUIDED mode (`mode guided` in MAVProxy) and continuously publishing setpoints |
-| `/mavros/local_position/pose` not publishing | MAVROS not receiving vision pose — check lio_mavros_bridge.py is running |
-| LIO-SAM odometry z plummets to -300+ | Wrong extrinsics — `extrinsicRot` must flip NED→ENU, `extrinsicRPY` must be identity (Section 13) |
-| LIO-SAM nodes collide / crash on drone2 launch | Use `namespace:=droneN` in launch command, not `PushRosNamespace` wrapper |
-| Vision pose `Subscription count: 0` | MAVROS namespace mismatch — add remap to bridge (Terminal 12) |
-| `use_sim_time` not taking effect | Check for duplicate `/**:` blocks or duplicate `ros__parameters:` keys in YAML |
-| "Not enough features" → drift | Lower `edgeFeatureMinValidNum` to 2, `edgeThreshold` to 0.5 |
-| MAVROS `connected: false` persists | Run `output add 127.0.0.1:14551` (drone 1) or `14561` (drone 2) in the correct MAVProxy console. Does not survive reboots |
-| MAVROS `connected: false` — drone 2 sees system ID 1 | `output add` was run in drone 1's MAVProxy by mistake. Remove it there, add in drone 2's |
-| No "EKF3 is using external nav" after param switch | Message only appears once per EKF init. If params are set and vision_pose is flowing, it's working — verify with stable hover after GPS off |
-| `PreArm: VisOdom: not healthy` oscillating | Normal at ~1.5 Hz — the 300ms health check timeout causes oscillation. Arm with GPS first (VISO_TYPE 0), switch mid-flight |
-| MAVROS drone 2 `detected remote address 1.1` | Both SITL instances default to MAV_SYSID=1. Run `param set MAV_SYSID 2` and `param save` in drone 2's MAVProxy |
-| `VISO_DELAY_MS` not found | Parameter exists in ArduCopter V4.8.0-dev as `VISO_DELAY_MS` (not `VISO_DELAY`). Run `param show VISO_*` to check |
-| Drone doesn't move despite GUIDED mode + setpoints | Setpoint publish rate too low — ArduCopter needs continuous stream at ≥10 Hz. The navigator uses 20 Hz timer. Do NOT use `use_sim_time:=true` on navigator nodes |
-| Navigator QoS warning on `local_position/pose` | MAVROS publishes with BEST_EFFORT QoS. Subscriber must match — use `QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT)` |
-| Drone flies to wrong position | Coordinate frame mismatch — waypoints are in Gazebo world frame, MAVROS uses local EKF frame. Convert with spawn offset: `local = world - spawn` |
-| Ground truth logger shows FALSE CLAIM for all | Logger's LIO-SAM odometry subscription may have QoS mismatch or topic name issue — known bug, does not affect mission execution |
+| Metric | How to measure | Expected result |
+|--------|---------------|-----------------|
+| Vision pose rate (Hz) | CSV vision_pose_hz column | Drops from ~10 Hz to <0.5 Hz |
+| Time to EKF failsafe | Time from attack start to Land Mode | Seconds |
+| Rate drop percentage | (baseline - attack) / baseline | >90% |
+| Recovery time | Time from attack end to rate restored | Seconds |
+| EKF lane switches | ArduPilot logs (EKF3 lane switch msgs) | Increases during attack |
