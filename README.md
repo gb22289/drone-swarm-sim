@@ -134,13 +134,14 @@ colcon build --packages-select lio_sam --cmake-args -DBUILD_TESTING=OFF
 source install/setup.bash
 ```
 
-### LIO-SAM Configuration (`~/ros2_ws/src/LIO-SAM/config/params.yaml`)
+### LIO-SAM Configuration (`~/ros2_ws/src/LIO-SAM/config/params_droneN.yaml`)
 
-Key values to set:
+Key values to set. Note the LiDAR topic is `points_timed` — this is the
+output of the deskew shim (Section 7b), not the raw bridge output.
 
 ```yaml
-pointCloudTopic: "/lidar/points"
-imuTopic: "/imu/data"
+pointCloudTopic: "/drone1/lidar/points_timed"
+imuTopic: "/drone1/imu/data"
 sensor: velodyne
 N_SCAN: 16
 Horizon_SCAN: 1800
@@ -233,7 +234,7 @@ Verify the sensor is publishing after launch:
 
 ```bash
 gz topic -e -t /lidar/points/points --duration 5   # should stream binary data
-ros2 topic hz /lidar/points                         # should show ~2 Hz
+ros2 topic hz /drone1/lidar/points                  # should show ~1 Hz (after bridge)
 ```
 
 ---
@@ -243,7 +244,7 @@ ros2 topic hz /lidar/points                         # should show ~2 Hz
 Create `~/ros2_ws/bridge.yaml`:
 
 ```yaml
-- ros_topic_name: "/drone1/lidar/points_raw"
+- ros_topic_name: "/drone1/lidar/points"
   gz_topic_name: "/drone1/lidar/points/points"
   ros_type_name: "sensor_msgs/msg/PointCloud2"
   gz_type_name: "gz.msgs.PointCloudPacked"
@@ -254,46 +255,117 @@ Create `~/ros2_ws/bridge.yaml`:
   ros_type_name: "sensor_msgs/msg/Imu"
   gz_type_name: "gz.msgs.IMU"
   direction: GZ_TO_ROS
+
+- ros_topic_name: "/clock"
+  gz_topic_name: "/clock"
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+  gz_type_name: "gz.msgs.Clock"
+  direction: GZ_TO_ROS
 ```
 
-> The LiDAR topic is named `points_raw` so the deskew relay (Section 7b) can add per-point timestamps before LIO-SAM receives the data. Without this, LIO-SAM cannot deskew the scans and the map becomes streaky over time.
+> **Critical — `/clock` mapping.** Both `ros_topic_name` and `gz_topic_name`
+> must be exactly `/clock`. Mapping to a different ROS name (e.g.
+> `/clock_raw`) will cause nodes running with `use_sim_time:=true`
+> (LIO-SAM, static_transform_publisher, tf2 listener, etc.) to subscribe to
+> a topic with zero publishers and hang waiting for sim time. Symptoms when
+> broken: `Large velocity, reset IMU-preintegration!` warnings, MAVROS
+> `Time jump detected`, EKF3 lane switches, LIO-SAM diverging to huge
+> position magnitudes during hover. Verify with:
+> ```
+> ros2 topic info /clock --verbose | grep "Publisher count"
+> # Must be: Publisher count: 1
+> ros2 topic hz /clock --window 100
+> # Should be hundreds of Hz
+> ```
 
 ---
 
-## 7b. LiDAR Deskew Relay
+## 7b. LiDAR Deskew Shim
 
-The Gazebo VLP-16 bridge publishes PointCloud2 without a per-point `time` field. LIO-SAM requires this field for motion deskewing — correcting for the drone's movement during each LiDAR sweep. Without it, LIO-SAM prints `Point cloud timestamp not available, deskew function disabled` and the map accumulates registration errors.
+Gazebo's `gpu_lidar` sensor publishes `PointCloud2` messages without a
+per-point `time` field. LIO-SAM requires this field to perform motion
+deskewing — correcting each point's position for drone motion during the
+scan sweep. Without it, LIO-SAM prints the warning
+`Point cloud timestamp not available, deskew function disabled, system
+will drift significantly!` at startup and the pose estimate drifts during
+hover, eventually triggering `Large velocity` resets and SLAM divergence
+within ~90 seconds.
 
-The deskew relay sits between the bridge and LIO-SAM:
+The deskew shim sits between the bridge and LIO-SAM:
 
 ```
-Bridge → /droneX/lidar/points_raw → [deskew relay adds 'time'] → /droneX/lidar/points → LIO-SAM
+Gazebo → ros_gz_bridge → /drone1/lidar/points   (raw, no time field)
+                       → [deskew shim adds 'time'] 
+                       → /drone1/lidar/points_timed
+                       → LIO-SAM
 ```
 
-The relay adds a synthetic `time` field to each scan based on ring number (VLP-16 vertical beam index), distributing timestamps from 0 to 0.1s across the sweep. This is part of the `swarm_mission` package.
+The shim handles mixed-datatype point clouds (the Gazebo output includes
+`x,y,z,intensity` as float32 and `ring` as uint16) via a numpy structured
+dtype, and synthesises a per-point `time` field in `[0, scan_period)`
+based on azimuth angle, mimicking the firing order of a real rotating
+LiDAR. It also guards against NaN/Inf coordinates (present in some
+out-of-range rays and in manipulated scans from attack nodes), which if
+left unhandled propagate into the time field, disable deskew on that
+scan, and can segfault PCL's KDTree in LIO-SAM's mapOptimization.
 
 ```bash
-# Build (if not already built)
+# Build (after copying lidar_deskew_shim.py into swarm_mission package
+# and registering it as a console_script in setup.py)
 cd ~/ros2_ws && colcon build --packages-select swarm_mission && source install/setup.bash
 
-# Run for each drone (in separate terminals, BEFORE LIO-SAM)
-ros2 run swarm_mission lidar_deskew_relay --ros-args -p drone_ns:=drone1
-ros2 run swarm_mission lidar_deskew_relay --ros-args -p drone_ns:=drone2
+# Run — one per drone, in a separate terminal, BEFORE LIO-SAM starts
+ros2 run swarm_mission lidar_deskew_shim --ros-args \
+  -p input_topic:=/drone1/lidar/points \
+  -p output_topic:=/drone1/lidar/points_timed \
+  -p scan_period:=0.1
+
+# Drone 2 equivalent
+ros2 run swarm_mission lidar_deskew_shim --ros-args \
+  -p input_topic:=/drone2/lidar/points \
+  -p output_topic:=/drone2/lidar/points_timed \
+  -p scan_period:=0.1
 ```
 
-Verify the relay is working:
+Verify the shim is working:
 
 ```bash
-# Raw from bridge (no 'time' field)
-ros2 topic echo /drone1/lidar/points_raw --field fields --once
-
-# After relay (should include 'time' field)
+# Raw bridge output (no 'time' field)
 ros2 topic echo /drone1/lidar/points --field fields --once
+# Fields: x, y, z, intensity, ring
 
-# Rate should match
-ros2 topic hz /drone1/lidar/points      # ~2 Hz
-ros2 topic hz /drone1/lidar/points_raw   # ~2 Hz
+# After shim (should include 'time' field)
+ros2 topic echo /drone1/lidar/points_timed --field fields --once
+# Fields: x, y, z, intensity, ring, time
+
+# Rates should match
+ros2 topic hz /drone1/lidar/points         # ~1 Hz (wall-clock, at ~47% RTF)
+ros2 topic hz /drone1/lidar/points_timed   # ~1 Hz
 ```
+
+On startup the shim logs its parsed schema once, plus frame progress:
+
+```
+Deskew shim active: /drone1/lidar/points -> /drone1/lidar/points_timed (scan_period=0.1s)
+Parsed schema: point_step=32, fields=[x, y, z, intensity, ring], first_point_raw=(...)
+frame 1: 5760 pts, time range [0.0000, 0.0997]s
+```
+
+> **Why synthetic timing rather than real per-point times?** Gazebo's
+> `gpu_lidar` fires all rays at the same simulation-step instant, so
+> there are no "real" per-point timestamps to forward. The shim models
+> the firing order of a rotating LiDAR (e.g., Velodyne VLP-16), which is
+> the convention LIO-SAM was designed for. Document this as a
+> methodology choice: *"LiDAR point timestamps are synthesised from
+> azimuth angle to model rotating-scanner firing order, as Gazebo's
+> `gpu_lidar` sensor emits all rays at the simulation-step instant."*
+
+> **Effect on attack surface:** LIO-SAM with deskew enabled is actually
+> *more* vulnerable to scan-rotation attacks than the deskew-disabled
+> variant — deskew gives the attacker a route to slip manipulated poses
+> past the first line of defense, so the factor graph accepts rotated
+> scans and diverges visibly rather than simply stalling. This is a
+> counterintuitive security finding worth noting in Chapter 4.
 
 ---
 
@@ -325,7 +397,9 @@ class LioMavrosBridge(Node):
 
     def odom_callback(self, msg):
         pose_msg = PoseStamped()
-        pose_msg.header.stamp = msg.header.stamp
+        # Rewrite stamp to wall-clock. MAVROS/EKF3 run in wall-time; vision_pose
+        # messages carrying sim-time stamps are rejected as stale.
+        pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = 'map'
         pose_msg.pose = msg.pose.pose
         self.pub.publish(pose_msg)
@@ -339,6 +413,14 @@ def main():
 if __name__ == '__main__':
     main()
 ```
+
+> **Timestamp rewrite is load-bearing.** LIO-SAM publishes with sim-time
+> stamps (because it runs with `use_sim_time:=true`). MAVROS and
+> ArduCopter's EKF3 run in wall-time and reject vision_pose messages
+> whose stamps deviate from the current wall-clock. This node must
+> rewrite `header.stamp` to `self.get_clock().now()` before publishing.
+> Without the rewrite, EKF3 never accepts vision updates and `EK3_SRC1`
+> stays frozen.
 
 ---
 
@@ -359,10 +441,12 @@ Edit `~/sim/ardupilot_gazebo/worlds/iris_warehouse.sdf` and add a second drone i
 
 > Each drone needs a unique `<name>` — this is what Gazebo uses to namespace its sensor topics. Drone 2's LiDAR will publish to `/drone2/lidar/points/points` and its IMU to the equivalent path. Verify after launch with `gz topic -l | grep iris_with_gimbal_2`.
 
-Also create a second bridge config at `~/ros2_ws/bridge2.yaml`:
+Also create a second bridge config at `~/ros2_ws/bridge2.yaml`. `/clock`
+is bridged by the drone 1 bridge — do not include it here (two publishers
+on `/clock` cause race conditions in DDS).
 
 ```yaml
-- ros_topic_name: "/drone2/lidar/points_raw"
+- ros_topic_name: "/drone2/lidar/points"
   gz_topic_name: "/drone2/lidar/points/points"
   ros_type_name: "sensor_msgs/msg/PointCloud2"
   gz_type_name: "gz.msgs.PointCloudPacked"
@@ -376,29 +460,33 @@ Also create a second bridge config at `~/ros2_ws/bridge2.yaml`:
 ```
 
 > Check the exact Gazebo IMU topic path for drone 2 with: `gz topic -l | grep imu | grep gimbal_2`
-> The LiDAR topic uses `points_raw` — the deskew relay (Section 7b) republishes to `points` after adding per-point timestamps.
+> The deskew shim (Section 7b) reads from `/drone2/lidar/points` and republishes to `/drone2/lidar/points_timed` — that's what LIO-SAM drone 2 subscribes to.
 
 ---
 
 ## 10. Full Startup Order — Single Drone
 
-Run each in a separate terminal in this exact order:
+Run each in a separate terminal in this exact order. **Order matters:**
+`/clock` must be flowing before any node with `use_sim_time:=true` starts,
+and the deskew shim must be running before LIO-SAM starts.
 
 ```bash
 # Terminal 1 — Gazebo
 cd ~/sim/ardupilot_gazebo
 gz sim worlds/iris_warehouse.sdf -r
 
-# Terminal 2 — SITL drone 1 (wait for Gazebo to fully load first)
+# Terminal 2 — ros_gz bridge (MUST come early — publishes /clock, lidar, imu)
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+ros2 run ros_gz_bridge parameter_bridge --ros-args \
+  -p config_file:=$HOME/ros2_ws/bridge.yaml
+# Verify: ros2 topic hz /clock  (should be hundreds of Hz)
+
+# Terminal 3 — SITL drone 1
 cd ~/sim/ardupilot/ArduCopter
 sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
 
 # --- In Drone 1 MAVProxy console, add localhost output for MAVROS ---
 #   output add 127.0.0.1:14551
-
-# Terminal 3 — ros_gz bridge (drone 1)
-source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
-ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
 
 # Terminal 4 — MAVROS (drone 1, port 14551)
 source /opt/ros/humble/setup.bash
@@ -406,13 +494,24 @@ ros2 launch mavros apm.launch fcu_url:=udp://:14551@localhost \
   tgt_system:=1 \
   config_yaml:=$HOME/ros2_ws/mavros_drone1.yaml
 
-# Terminal 5 — LIO-SAM (drone 1)
+# Terminal 5 — LiDAR deskew shim (MUST come before LIO-SAM)
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission lidar_deskew_shim --ros-args \
+  -p input_topic:=/drone1/lidar/points \
+  -p output_topic:=/drone1/lidar/points_timed \
+  -p scan_period:=0.1
+# Verify: ros2 topic echo /drone1/lidar/points_timed --field fields --once
+#         should list 'time' as a field
+
+# Terminal 6 — LIO-SAM (reads /drone1/lidar/points_timed)
 source ~/ros2_ws/install/setup.bash
 ros2 launch lio_sam run.launch.py \
   params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone1.yaml \
   namespace:=drone1
+# Watch for absence of "Point cloud timestamp not available" warning
+# Let LIO-SAM sit stationary for ~10 seconds for IMU bias estimation
 
-# Terminal 6 — LIO-SAM → MAVROS bridge (drone 1)
+# Terminal 7 — LIO-SAM → MAVROS bridge (drone 1)
 source ~/ros2_ws/install/setup.bash
 python3 ~/ros2_ws/src/lio_mavros_bridge.py
 ```
@@ -421,13 +520,14 @@ python3 ~/ros2_ws/src/lio_mavros_bridge.py
 
 ## 11. Full Startup Order — Two Drones
 
-Requires the two-drone world SDF setup from Section 9. Each drone needs its own SITL instance, bridge, MAVROS, static TF publishers, LIO-SAM, and bridge node — all namespaced separately.
+Requires the two-drone world SDF setup from Section 9. Each drone needs its own SITL instance, bridge, MAVROS, deskew shim, static TF publishers, LIO-SAM, and bridge node — all namespaced separately.
 
 ### Namespace Architecture
 
 | Component | Drone 1 | Drone 2 |
 |---|---|---|
-| LiDAR topic | `/drone1/lidar/points` | `/drone2/lidar/points` |
+| LiDAR raw (post-bridge) | `/drone1/lidar/points` | `/drone2/lidar/points` |
+| LiDAR timed (post-shim) | `/drone1/lidar/points_timed` | `/drone2/lidar/points_timed` |
 | IMU topic | `/drone1/imu/data` | `/drone2/imu/data` |
 | Odometry | `/drone1/lio_sam/mapping/odometry_incremental` | `/drone2/lio_sam/mapping/odometry_incremental` |
 | Vision pose | `/drone1/mavros/vision_pose/pose` | `/drone2/mavros/vision_pose/pose` |
@@ -462,11 +562,22 @@ EOF
 cd ~/sim/ardupilot_gazebo
 gz sim worlds/iris_warehouse.sdf -r
 
-# Terminal 2 — SITL drone 1 (instance 0, ports 14550/14551)
+# Terminal 2 — ros_gz bridge drone 1 (brings up /clock — MUST come early)
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+ros2 run ros_gz_bridge parameter_bridge --ros-args \
+  -p config_file:=$HOME/ros2_ws/bridge.yaml
+# Verify: ros2 topic hz /clock
+
+# Terminal 3 — ros_gz bridge drone 2 (no /clock, already bridged by drone 1)
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+ros2 run ros_gz_bridge parameter_bridge --ros-args \
+  -p config_file:=$HOME/ros2_ws/bridge2.yaml
+
+# Terminal 4 — SITL drone 1 (instance 0, ports 14550/14551)
 cd ~/sim/ardupilot/ArduCopter
 sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console -I0
 
-# Terminal 3 — SITL drone 2 (instance 1, ports 14560/14561)
+# Terminal 5 — SITL drone 2 (instance 1, ports 14560/14561)
 cd ~/sim/ardupilot/ArduCopter
 sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console -I1
 
@@ -485,29 +596,10 @@ sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --console -I1
 #
 # MAV_SYSID: Both SITL instances default to system ID 1. Drone 2's MAVROS
 # uses tgt_system:=2, so it will ignore packets from system 1. You MUST
-# set MAV_SYSID to 2 on drone 2's SITL. The "Failed to set" warning is
-# normal — the system ID change confuses MAVProxy, but it takes effect.
-# MAV_SYSID survives param save, so you only need to set it once.
+# set MAV_SYSID to 2 on drone 2's SITL. MAV_SYSID survives param save.
 #
 # Verify with: output  (lists all active outputs)
 # NOTE: output add does NOT survive SITL reboots. Re-add after every reboot.
-# NOTE: MAV_SYSID DOES survive reboots (saved to eeprom).
-
-# Terminal 4 — ros_gz bridge drone 1
-source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
-ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge.yaml
-
-# Terminal 5 — ros_gz bridge drone 2
-source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
-ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=$HOME/ros2_ws/bridge2.yaml
-
-# Terminal 5a — Deskew relay drone 1 (run BEFORE LIO-SAM)
-source ~/ros2_ws/install/setup.bash
-ros2 run swarm_mission lidar_deskew_relay --ros-args -p drone_ns:=drone1
-
-# Terminal 5b — Deskew relay drone 2 (run BEFORE LIO-SAM)
-source ~/ros2_ws/install/setup.bash
-ros2 run swarm_mission lidar_deskew_relay --ros-args -p drone_ns:=drone2
 
 # Terminal 6 — MAVROS drone 1 (port 14551)
 source /opt/ros/humble/setup.bash
@@ -524,17 +616,31 @@ ros2 launch mavros apm.launch \
   namespace:=drone2/mavros \
   config_yaml:=$HOME/ros2_ws/mavros_drone2.yaml
 
-# Terminal 8 — Static TF drone 1
+# Terminal 8 — Deskew shim drone 1 (run BEFORE LIO-SAM)
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission lidar_deskew_shim --ros-args \
+  -p input_topic:=/drone1/lidar/points \
+  -p output_topic:=/drone1/lidar/points_timed \
+  -p scan_period:=0.1
+
+# Terminal 9 — Deskew shim drone 2 (run BEFORE LIO-SAM)
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission lidar_deskew_shim --ros-args \
+  -p input_topic:=/drone2/lidar/points \
+  -p output_topic:=/drone2/lidar/points_timed \
+  -p scan_period:=0.1
+
+# Terminal 10 — Static TF drone 1
 source /opt/ros/humble/setup.bash
 ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 base_link drone1/base_link &
 ros2 run tf2_ros static_transform_publisher 0 0 0.1 0 0 0 drone1/base_link drone1/lidar_link
 
-# Terminal 9 — Static TF drone 2
+# Terminal 11 — Static TF drone 2
 source /opt/ros/humble/setup.bash
 ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 base_link drone2/base_link &
 ros2 run tf2_ros static_transform_publisher 0 0 0.1 0 0 0 drone2/base_link drone2/lidar_link
 
-# Terminal 10 — LIO-SAM drone 1
+# Terminal 12 — LIO-SAM drone 1 (reads points_timed)
 # IMPORTANT: Use namespace:= argument to run.launch.py (NOT PushRosNamespace).
 # LIO-SAM's run.launch.py sets namespace= on each Node directly, which
 # overrides PushRosNamespace. Without this, both drones' LIO-SAM nodes
@@ -544,13 +650,13 @@ ros2 launch lio_sam run.launch.py \
   params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone1.yaml \
   namespace:=drone1
 
-# Terminal 11 — LIO-SAM drone 2
+# Terminal 13 — LIO-SAM drone 2 (reads points_timed)
 source ~/ros2_ws/install/setup.bash
 ros2 launch lio_sam run.launch.py \
   params_file:=$HOME/ros2_ws/src/LIO-SAM/config/params_drone2.yaml \
   namespace:=drone2
 
-# Terminal 12 — LIO-SAM → MAVROS bridge drone 1
+# Terminal 14 — LIO-SAM → MAVROS bridge drone 1
 # IMPORTANT: MAVROS drone1 may subscribe on /mavros/vision_pose/pose (no drone1/
 # prefix) even when launched with ros_namespace. The remap below fixes this.
 # Verify with: ros2 topic info /mavros/vision_pose/pose (Subscription count: 1)
@@ -559,32 +665,44 @@ python3 ~/ros2_ws/src/lio_mavros_bridge.py --ros-args \
   -p drone_ns:=drone1 \
   -r /drone1/mavros/vision_pose/pose:=/mavros/vision_pose/pose
 
-# Terminal 13 — LIO-SAM → MAVROS bridge drone 2
+# Terminal 15 — LIO-SAM → MAVROS bridge drone 2
 source ~/ros2_ws/install/setup.bash
 python3 ~/ros2_ws/src/lio_mavros_bridge.py --ros-args -p drone_ns:=drone2
 ```
 
-> **Launch order matters:** The deskew relay must be running before LIO-SAM starts, otherwise LIO-SAM receives raw scans without the `time` field and disables deskewing. If you see the deskew warning, restart LIO-SAM (the relay can stay running).
+> **Launch order recap:** Gazebo → bridge (/clock flowing) → SITL → MAVROS
+> → deskew shims → static TFs → LIO-SAM → lio_mavros_bridge. If LIO-SAM
+> starts before its shim, it will bind to an untimed topic and emit the
+> deskew warning. Kill and relaunch LIO-SAM (not the shim) if this
+> happens.
 
 ### Verify both drones are up
 
 ```bash
+# /clock flowing (catches bridge misconfig)
+ros2 topic info /clock --verbose | grep "Publisher count"   # = 1
+
 # Sensors flowing
-ros2 topic hz /drone1/lidar/points          # ~2Hz
-ros2 topic hz /drone2/lidar/points          # ~2Hz
-ros2 topic hz /drone1/imu/data              # ~1000Hz
-ros2 topic hz /drone2/imu/data              # ~1000Hz
+ros2 topic hz /drone1/lidar/points         # ~1Hz (raw)
+ros2 topic hz /drone1/lidar/points_timed   # ~1Hz (post-shim)
+ros2 topic hz /drone2/lidar/points         # ~1Hz
+ros2 topic hz /drone2/lidar/points_timed   # ~1Hz
+ros2 topic hz /drone1/imu/data             # ~500Hz
+ros2 topic hz /drone2/imu/data             # ~500Hz
+
+# Deskew shim working — 'time' field present
+ros2 topic echo /drone1/lidar/points_timed --field fields --once
+# Must include: PointField(name='time', ...)
 
 # LIO-SAM nodes properly namespaced (CRITICAL check)
 ros2 node list | grep lio
 # Should show /drone1/lio_sam_* and /drone2/lio_sam_*
-# If you see bare /lio_sam_* without prefix, namespace arg was not passed
 
-# MAVROS connected (run after param fetch responds in each MAVProxy console)
+# MAVROS connected
 ros2 topic echo /mavros/state --once        # connected: true
 ros2 topic echo /drone2/mavros/state --once # connected: true
 
-# Vision pose reaching MAVROS (both Publisher and Subscription count must be >= 1)
+# Vision pose reaching MAVROS (both Publisher and Subscription count >= 1)
 ros2 topic info /mavros/vision_pose/pose
 ros2 topic info /drone2/mavros/vision_pose/pose
 
@@ -592,10 +710,6 @@ ros2 topic info /drone2/mavros/vision_pose/pose
 ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental
 ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental
 ```
-
-> **MAVProxy note:** Each SITL instance opens its own MAVProxy console. Drone 1 is on the window that launched with `--map --console`. Drone 2's console is the plain window from `-I1`. Run bootstrap and parameter commands in the correct window for each drone.
-
-> **MAVROS connected: false** is normal immediately after launch — wait a few seconds for the heartbeat. If it stays `connected: false`, check: (1) you ran `output add 127.0.0.1:14551` / `14561` in the correct MAVProxy console, (2) MAVROS is using port 14551/14561 not 14550/14560, (3) the output was added in the right drone's MAVProxy (check with `output` command — drone 2's MAVROS seeing system ID 1 means the output was added in drone 1's console by mistake).
 
 ---
 
@@ -640,16 +754,17 @@ ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental
 ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental
 ```
 
-Both should start publishing within a few seconds of the drones moving. Also verify vision_pose is reaching MAVROS:
+Both should start publishing within a few seconds of the drones moving.
+Also verify vision_pose is reaching MAVROS:
 
 ```bash
-ros2 topic hz /mavros/vision_pose/pose              # ~1.5Hz
-ros2 topic hz /drone2/mavros/vision_pose/pose       # ~1.5Hz
+ros2 topic hz /mavros/vision_pose/pose              # ~20Hz
+ros2 topic hz /drone2/mavros/vision_pose/pose       # ~20Hz
 ```
 
 ### Step 3 — Switch to LIO-SAM nav (both drones)
 
-Once odometry is publishing **and** `ros2 topic hz /mavros/vision_pose/pose` shows ~1.5 Hz, run in **each** MAVProxy console:
+Once odometry is publishing **and** `ros2 topic hz /mavros/vision_pose/pose` shows ~20 Hz, run in **each** MAVProxy console:
 
 ```bash
 param set VISO_DELAY_MS 50
@@ -668,23 +783,20 @@ param set VISO_TYPE 1
 ```bash
 ros2 topic hz /drone1/lio_sam/mapping/odometry_incremental  # publishing
 ros2 topic hz /drone2/lio_sam/mapping/odometry_incremental  # publishing
-ros2 topic hz /drone1/mavros/vision_pose/pose               # ~2Hz
-ros2 topic hz /drone2/mavros/vision_pose/pose               # ~2Hz
+ros2 topic hz /drone1/mavros/vision_pose/pose               # ~20Hz
+ros2 topic hz /drone2/mavros/vision_pose/pose               # ~20Hz
 ros2 topic echo /mavros/state --once                        # armed: true, guided: true
 ros2 topic echo /drone2/mavros/state --once                 # armed: true, guided: true
 ```
 
-> **Note:** The "Large velocity, reset IMU-preintegration" warning appears periodically due to Gazebo clock synchronisation artefacts from running two SITL instances. This is a known simulation limitation — LIO-SAM self-corrects within ~1 second. Document this in methodology as: *"periodic clock sync artefacts cause brief (~1s) IMU resets at ~30s intervals; measurements taken during stable inter-reset windows."*
-
 ---
 
-## 13. Gazebo Clock Patches for LIO-SAM
-
-Two SITL instances competing for the Gazebo physics timestep cause periodic ~0.8s backward clock jumps. These corrupt LIO-SAM's IMU preintegration, causing `gtsam::IndeterminantLinearSystemException` crashes. The following patches are **required** for stable multi-drone simulation.
+## 13. LIO-SAM Patches
 
 ### Patch 1: IMU dt guards (`imuPreintegration.cpp`)
 
-Three places where `double dt = ...` is computed. After each, add guards:
+Three places where `double dt = ...` is computed. After each, add guards
+to handle non-monotonic timestamps from sim-time irregularities:
 
 **Location A — optimization IMU loop (~line 392):**
 ```cpp
@@ -766,7 +878,55 @@ cd ~/ros2_ws && colcon build --packages-select lio_sam
 
 ---
 
-## 14. Autonomous Navigation (GUIDED Mode Waypoints)
+## 14. Clock Synchronisation — Three Domains
+
+Three distinct time domains coexist in this simulation:
+
+1. **Gazebo sim-time** — published on `/clock` via ros_gz_bridge. Used by
+   any ROS2 node launched with `use_sim_time:=true` (LIO-SAM, tf2
+   listeners, static_transform_publisher, etc.).
+2. **Wall-time** — used by MAVROS and RViz by default. Progresses at
+   real clock speed regardless of simulation RTF.
+3. **ArduCopter SITL internal time** — mostly wall-time, but delivered
+   to MAVROS via MAVLink messages whose stamps reflect the FCU's
+   internal notion of time.
+
+### Consequences
+
+- **LIO-SAM → MAVROS bridge** must rewrite timestamps to wall-clock
+  before publishing `vision_pose`. EKF3 rejects vision_pose with
+  sim-time stamps as stale. See Section 8.
+- **LIO-SAM IMU preintegration** requires monotonic sim-time from
+  `/clock`. When `/clock` stalls (bridge misconfig, RTF collapse) or
+  jumps, imuPreintegration's `dt` computation produces negative or huge
+  values, triggering `Large velocity, reset IMU-preintegration!`. The
+  dt guards in Section 13 Patch 1 catch these and avoid GTSAM crashes,
+  but the underlying `/clock` flow still needs to be healthy.
+- **IMU source** used by LIO-SAM is `/drone1/imu/data` from Gazebo
+  (~500 Hz at sim-time, ~235 Hz wall-clock at 47% RTF), **not**
+  `/mavros/imu/data` which is bottlenecked through MAVLink stream rates
+  (~2 Hz on ArduPilot defaults). This is intentional — LIO-SAM needs
+  high-rate IMU for factor-graph optimization, and the Gazebo sensor
+  plugin bypasses MAVLink entirely.
+
+### Verifying clock health
+
+```bash
+# /clock has a publisher (bridge is mapping it correctly)
+ros2 topic info /clock --verbose | grep "Publisher count"   # = 1
+# Should NEVER be 0 — if it is, bridge.yaml is pointing to the wrong topic
+
+# /clock is flowing at a sensible rate
+ros2 topic hz /clock --window 500
+# Expect several hundred Hz; 0.2 Hz or silence indicates bridge failure
+
+# Gazebo RTF (check GUI window)
+# Should be > 30% for stable operation
+```
+
+---
+
+## 15. Autonomous Navigation (GUIDED Mode Waypoints)
 
 Once the drone is airborne and LIO-SAM is active, you can command autonomous movement via MAVROS position setpoints. This is the foundation for the swarm attack experiments.
 
@@ -870,7 +1030,6 @@ class WaypointPatrol(Node):
 def main():
     rclpy.init()
     node = WaypointPatrol()
-    # Brief wait for connections
     time.sleep(2.0)
     node.run_patrol()
     rclpy.shutdown()
@@ -885,18 +1044,6 @@ Run it:
 python3 ~/ros2_ws/src/waypoint_patrol.py
 ```
 
-Monitor progress:
-
-```bash
-# Watch drone position update in real time
-ros2 topic echo /mavros/local_position/pose
-
-# Confirm LIO-SAM is still tracking during movement
-ros2 topic hz /lio_sam/mapping/odometry
-```
-
-> **If the drone doesn't move:** confirm it is in GUIDED mode (`mode guided` in MAVProxy) and that `/mavros/local_position/pose` is publishing. The drone must be receiving a continuous stream of setpoints — a single publish is not sufficient for GUIDED mode.
-
 ---
 
 ## Architecture Overview
@@ -904,32 +1051,38 @@ ros2 topic hz /lio_sam/mapping/odometry
 ```
 Gazebo Sim (iris_warehouse)
     │
-    ├── VLP-16 LiDAR → /lidar/points/points (gz topic)
-    └── IMU sensor   → /world/.../imu (gz topic)
+    ├── VLP-16 LiDAR → /droneN/lidar/points/points (gz topic)
+    ├── IMU sensor   → /world/.../imu                (gz topic)
+    └── /clock                                       (gz topic)
            │
       ros_gz_bridge
            │
-    ├── /lidar/points  (sensor_msgs/PointCloud2)
-    └── /imu/data      (sensor_msgs/Imu)
+    ├── /droneN/lidar/points  (sensor_msgs/PointCloud2, no time field)
+    ├── /droneN/imu/data      (sensor_msgs/Imu)
+    └── /clock                (rosgraph_msgs/Clock, required by use_sim_time)
            │
-        LIO-SAM
+    lidar_deskew_shim         (adds per-point 'time' field from azimuth)
            │
-    /lio_sam/mapping/odometry
+    /droneN/lidar/points_timed (sensor_msgs/PointCloud2 with time)
            │
-    lio_mavros_bridge.py
+        LIO-SAM                (deskew enabled; stable hover, factor graph converges)
+           │
+    /droneN/lio_sam/mapping/odometry
+           │
+    lio_mavros_bridge.py       (rewrites stamp to wall-clock)
            │
     /mavros/vision_pose/pose
            │
         MAVROS
            │
-    ArduCopter SITL (EKF3 External Nav)
+    ArduCopter SITL            (EKF3 External Nav via VISO_TYPE=1)
            │
-    /mavros/setpoint_position/local  ← waypoint_patrol.py sends targets here
+    /mavros/setpoint_position/local  ← waypoint_patrol / navigator / attackers
 ```
 
 ---
 
-## 15. Cooperative Inspection Mission (Byzantine Fault Experiments)
+## 16. Cooperative Inspection Mission (Byzantine Fault Experiments)
 
 GPS-denied environments force drones to rely on cooperative data sharing — there is no external oracle to verify position claims. This mission exploits that trust dependency: drones divide a warehouse into waypoint zones, share completion status, and skip waypoints reported as visited by partners. A Byzantine drone can exploit this by falsely reporting coverage, leaving blind spots.
 
@@ -986,24 +1139,24 @@ Each drone reads its assigned waypoints from `config/waypoints.yaml`, flies to t
 After completing prerequisites above, run in separate terminals:
 
 ```bash
-# Terminal 14 — Build (if not already built)
+# Terminal 16 — Build (if not already built)
 cd ~/ros2_ws && colcon build --packages-select swarm_mission && source install/setup.bash
 
-# Terminal 15 — Drone 1 navigator
+# Terminal 17 — Drone 1 navigator
 source ~/ros2_ws/install/setup.bash
 ros2 run swarm_mission waypoint_navigator --ros-args \
   -p drone_id:=drone1 -p byzantine:=false \
   -p spawn_x:=-6.0 -p spawn_y:=0.0 \
   -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
 
-# Terminal 16 — Drone 2 navigator
+# Terminal 18 — Drone 2 navigator
 source ~/ros2_ws/install/setup.bash
 ros2 run swarm_mission waypoint_navigator --ros-args \
   -p drone_id:=drone2 -p byzantine:=false \
   -p spawn_x:=-3.0 -p spawn_y:=0.0 \
   -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
 
-# Terminal 17 — Ground truth logger
+# Terminal 19 — Ground truth logger
 source ~/ros2_ws/install/setup.bash
 ros2 run swarm_mission ground_truth_logger --ros-args \
   -p config_file:=$HOME/ros2_ws/src/swarm_mission/config/waypoints.yaml
@@ -1045,9 +1198,55 @@ Coordinate conversion reminder: `local = world - spawn`
 
 ---
 
-## 16. Layer 2 Attacks — Navigation Pipeline
+## 17. Layer 2 Attacks — Navigation Pipeline
 
 These attacks target the LiDAR-inertial navigation pipeline (LIO-SAM → MAVROS → ArduCopter EKF3). They operate under the attacker model of a network participant that can publish/subscribe to any DDS topic (SROS2 disabled), but cannot intercept, modify, or reconfigure victim systems.
+
+### Scan Manipulation — Gradual Rotation (lidar_manipulator)
+
+Subscribes to the target drone's LiDAR topic, rotates the point cloud
+around Z by a ramping angle (configurable rate in °/s), and republishes
+on the same topic. LIO-SAM consumes both real and manipulated scans;
+scan-to-map ICP converges to progressively wrong poses, the factor
+graph accumulates bias, and imuPreintegration's dt/velocity guards
+eventually fire, halting the pipeline.
+
+With deskew enabled (Section 7b), LIO-SAM's internal map visibly
+corrupts during the attack — multiple keyframe warehouse clusters
+appear along a trajectory the drone never flew. Time-to-failure (TTF)
+from attack start to `Waiting for IMU data` loop is ~1-2 seconds
+across rotation rates 1-5 °/s.
+
+```bash
+source ~/ros2_ws/install/setup.bash
+ros2 run swarm_mission lidar_manipulator --ros-args \
+  -p target_drone:=drone1 \
+  -p rotation_rate_dps:=1.0 \
+  -p translation_rate_mps:=0.05
+```
+
+### Scan Manipulation Sweep Runner
+
+`sweep_runner.sh` automates multi-trial experiments:
+
+```bash
+./sweep_runner.sh <rotation_rate_dps> <run_number>
+# example: ./sweep_runner.sh 1.0 1
+```
+
+Runs a single trial with the given rotation rate and run ID. Writes a
+row to `~/results/scan_sweep/summary.csv` containing the TTF and other
+metrics. Preflight checks zombie processes before starting.
+
+### Pre-flight Check
+
+`preflight_check.sh` verifies the stack is healthy before running a
+trial (IMU rate, LiDAR rate, vision_pose rate, drone pose, LIO-SAM odom
+magnitude, zombie attackers, DDS shm). Exit code 0 = healthy.
+
+```bash
+./preflight_check.sh && ./sweep_runner.sh 1.0 1
+```
 
 ### Point Cloud Injection (pointcloud_injector.py)
 
@@ -1064,41 +1263,11 @@ ros2 run swarm_mission pointcloud_injector --ros-args \
   -p point_spacing:=0.15
 ```
 
-**Parameters:**
-
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| target_drone | drone1 | Which drone to attack |
-| wall_x | -10.0 | World X coordinate of the wall plane |
-| wall_y_min/max | -5.0 / 3.0 | Wall extent in Y |
-| wall_z_min/max | 0.0 / 3.5 | Wall extent in Z |
-| point_spacing | 0.15 | Metres between injected points |
-| spawn_x/y | -6.0 / 0.0 | Target drone's spawn position |
-| noise_sigma | 0.02 | Gaussian noise for realism |
-| injection_rate | 2.0 | Scans per second |
-
-**Topics:**
-
-| Drone | LiDAR topic (attack target) | Pose topic (for coordinate transform) |
-|-------|---------------------------|--------------------------------------|
-| drone1 | /drone1/lidar/points | /mavros/local_position/pose |
-| drone2 | /drone2/lidar/points | /drone2/mavros/local_position/pose |
-
-**Findings:** The phantom wall appears in the LIO-SAM point cloud map (visible in RViz) but does not cause significant odometry drift when published as separate scans. LIO-SAM's ICP scan matching + IMU preintegration prior are robust enough to absorb the additional geometry. The wall is accepted into the map as new features but does not bias the pose estimate. This is documented as a negative result — topic-level point cloud injection alone is insufficient to corrupt LIO-SAM's localisation when the real sensor data provides stronger geometric constraints.
+**Findings:** The phantom wall appears in the LIO-SAM point cloud map (visible in RViz) but does not cause significant odometry drift when published as separate scans. LIO-SAM's ICP scan matching + IMU preintegration prior are robust enough to absorb the additional geometry. This is documented as a negative result — topic-level point cloud injection alone is insufficient to corrupt LIO-SAM's localisation when the real sensor data provides stronger geometric constraints.
 
 ### QoS Profile Poisoning (qos_poisoner.py)
 
 Creates RELIABLE subscribers on LIO-SAM's BEST_EFFORT odometry topic, forcing the DDS middleware to satisfy the stricter QoS policy. This causes the odometry output rate to degrade, starving the vision pose bridge below ArduCopter's EKF3 minimum threshold (0.5 Hz), which triggers a Land Mode failsafe.
-
-**Attacker model:** Network participant that can SUBSCRIBE to any DDS topic (SROS2 disabled). No interception, modification, or reconfiguration of victim systems required.
-
-**How it works:**
-1. DDS publishers must satisfy ALL subscribers' QoS policies
-2. LIO-SAM publishes odometry as BEST_EFFORT (fire-and-forget, fast)
-3. The attacker creates RELIABLE subscribers, forcing buffering and acknowledgement
-4. The publisher slows down to satisfy the RELIABLE contract
-5. Downstream consumers (MAVROS vision_pose bridge) receive fewer messages
-6. ArduCopter's EKF3 detects the rate drop and triggers a failsafe
 
 ```bash
 # Automated attack with metric collection (3 phases: baseline → attack → recovery)
@@ -1111,36 +1280,11 @@ ros2 run swarm_mission qos_poisoner --ros-args \
   -p num_reliable_subs:=5
 ```
 
-**Parameters:**
-
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| target_drone | drone1 | Which drone to attack |
-| baseline_duration | 15.0 | Seconds of pre-attack measurement |
-| attack_duration | 45.0 | Seconds with RELIABLE subscribers active |
-| recovery_duration | 15.0 | Seconds of post-attack measurement |
-| num_reliable_subs | 5 | Number of RELIABLE subscribers to create |
-| rate_window | 3.0 | Sliding window (s) for Hz calculation |
-| output_dir | ~ | Directory for CSV output |
-
-**Output:** The node automatically collects metrics and saves to `~/qos_attack_metrics_<drone>_<timestamp>.csv` with columns: timestamp, phase, phase_elapsed_s, vision_pose_hz, odom_hz.
-
 **Manual attack (single command, no metrics):**
 
 ```bash
-# This alone can trigger the attack — just subscribe with RELIABLE QoS
 ros2 topic echo /drone1/lio_sam/mapping/odometry_incremental --qos-reliability reliable
 ```
-
-**Metrics to collect:**
-
-| Metric | How to measure | Expected result |
-|--------|---------------|-----------------|
-| Vision pose rate (Hz) | CSV vision_pose_hz column | Drops from ~10 Hz to <0.5 Hz |
-| Time to EKF failsafe | Time from attack start to Land Mode | Seconds |
-| Rate drop percentage | (baseline - attack) / baseline | >90% |
-| Recovery time | Time from attack end to rate restored | Seconds |
-| EKF lane switches | ArduPilot logs (EKF3 lane switch msgs) | Increases during attack |
 
 ---
 
@@ -1148,7 +1292,12 @@ ros2 topic echo /drone1/lio_sam/mapping/odometry_incremental --qos-reliability r
 
 | Issue | Fix |
 |---|---|
+| `/clock` has 0 publishers | bridge.yaml is publishing to `/clock_raw` or similar. Fix `ros_topic_name` to `/clock` (Section 7), restart bridge |
+| `Point cloud timestamp not available, deskew function disabled` | Deskew shim not running or started after LIO-SAM. Start shim first, then restart LIO-SAM (Section 7b) |
+| LIO-SAM odom diverges to 100+ metres during hover | Deskew disabled. Ensure shim is running and LIO-SAM's `pointCloudTopic` is `/droneN/lidar/points_timed` |
+| `Large velocity, reset IMU-preintegration!` warnings during baseline | `/clock` not flowing correctly — check Section 7 bridge config |
 | `gtsam::IndeterminantLinearSystemException` crash | Apply clock jump patches from Section 13 and rebuild |
+| `pcl::KdTreeFLANN::setInputCloud` empty cloud + mapOptimization segfault | Shim producing NaN time fields — ensure shim uses latest NaN-guard version (np.nan_to_num on output) |
 | `PreArm: VisOdom: not healthy` | LIO-SAM not publishing — use GPS bootstrap procedure |
 | `AHRS: waiting for home` | GPS not locked — restart SITL after setting `GPS1_TYPE 1` |
 | `EKF3 IMU stopped aiding` | Re-enable compass: `COMPASS_ENABLE 1`, `EK3_SRC1_YAW 1` |
@@ -1159,22 +1308,14 @@ ros2 topic echo /drone1/lio_sam/mapping/odometry_incremental --qos-reliability r
 | LiDAR sensor registered but zero messages | Ensure `type="gpu_lidar"` in model SDF — `type="lidar"` is not supported in Gazebo Harmonic |
 | LiDAR link renamed to `lidar_link(1)` | LiDAR block is in wrong model file — must be in `iris_with_standoffs`, not `iris_with_gimbal` |
 | Drone ignores setpoint commands | Must be in GUIDED mode (`mode guided` in MAVProxy) and continuously publishing setpoints |
-| `/mavros/local_position/pose` not publishing | MAVROS not receiving vision pose — check lio_mavros_bridge.py is running |
+| `/mavros/local_position/pose` not publishing | MAVROS not receiving vision pose — check `lio_mavros_bridge.py` is running AND rewriting stamp to wall-clock |
 | LIO-SAM odometry z plummets to -300+ | Wrong extrinsics — `extrinsicRot` must flip NED→ENU, `extrinsicRPY` must be identity (Section 13) |
 | LIO-SAM nodes collide / crash on drone2 launch | Use `namespace:=droneN` in launch command, not `PushRosNamespace` wrapper |
-| Vision pose `Subscription count: 0` | MAVROS namespace mismatch — add remap to bridge (Terminal 12) |
+| Vision pose `Subscription count: 0` | MAVROS namespace mismatch — add remap to bridge (Terminal 14) |
 | `use_sim_time` not taking effect | Check for duplicate `/**:` blocks or duplicate `ros__parameters:` keys in YAML |
 | "Not enough features" → drift | Lower `edgeFeatureMinValidNum` to 2, `edgeThreshold` to 0.5 |
-| MAVROS `connected: false` persists | Run `output add 127.0.0.1:14551` (drone 1) or `14561` (drone 2) in the correct MAVProxy console. Does not survive reboots |
-| MAVROS `connected: false` — drone 2 sees system ID 1 | `output add` was run in drone 1's MAVProxy by mistake. Remove it there, add in drone 2's |
-| No "EKF3 is using external nav" after param switch | Message only appears once per EKF init. If params are set and vision_pose is flowing, it's working — verify with stable hover after GPS off |
-| `PreArm: VisOdom: not healthy` oscillating | Normal at ~1.5 Hz — the 300ms health check timeout causes oscillation. Arm with GPS first (VISO_TYPE 0), switch mid-flight |
+| MAVROS `connected: false` persists | Run `output add 127.0.0.1:14551` (drone 1) or `14561` (drone 2) in the correct MAVProxy console |
 | MAVROS drone 2 `detected remote address 1.1` | Both SITL instances default to MAV_SYSID=1. Run `param set MAV_SYSID 2` and `param save` in drone 2's MAVProxy |
-| `VISO_DELAY_MS` not found | Parameter exists in ArduCopter V4.8.0-dev as `VISO_DELAY_MS` (not `VISO_DELAY`). Run `param show VISO_*` to check |
-| Drone doesn't move despite GUIDED mode + setpoints | Setpoint publish rate too low — ArduCopter needs continuous stream at ≥10 Hz. The navigator uses 20 Hz timer. Do NOT use `use_sim_time:=true` on navigator nodes |
-| Navigator QoS warning on `local_position/pose` | MAVROS publishes with BEST_EFFORT QoS. Subscriber must match — use `QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT)` |
-| Drone flies to wrong position | Coordinate frame mismatch — waypoints are in Gazebo world frame, MAVROS uses local EKF frame. Convert with spawn offset: `local = world - spawn` |
-| Ground truth logger shows FALSE CLAIM for all | Logger's LIO-SAM odometry subscription may have QoS mismatch or topic name issue — known bug, does not affect mission execution |
-| `Point cloud timestamp not available, deskew function disabled` | Deskew relay not running or not started before LIO-SAM. Start relay first, then restart LIO-SAM (Section 7b) |
-| Map becomes streaky over time | Deskew is disabled — ensure bridge publishes to `points_raw` and deskew relay is running (Section 7b) |
-| Deskew relay not receiving data | Check bridge.yaml uses `points_raw` for ros_topic_name and `points/points` for gz_topic_name (not `points_raw/points`) |
+| Sweep runner reports zombie nodes | Kill survivors: `pkill -9 -f "swarm_mission.lidar_manipulator"` and same for logger; then `ros2 daemon stop; sleep 1; ros2 daemon start` to flush graph cache |
+| MAVROS `Time jump detected` / EKF3 lane switches | Cosmetic under WSL2 clock irregularities; not blocking unless `/clock` rate drops below ~100 Hz |
+| MAVROS IMU rate 1.9 Hz vs Gazebo IMU 470 Hz | Expected — LIO-SAM uses `/droneN/imu/data` (Gazebo sensor direct), not `/mavros/imu/data`. Don't try to "fix" the MAVROS rate |
