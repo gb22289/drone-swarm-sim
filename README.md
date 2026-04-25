@@ -1265,6 +1265,100 @@ ros2 run swarm_mission pointcloud_injector --ros-args \
 
 **Findings:** The phantom wall appears in the LIO-SAM point cloud map (visible in RViz) but does not cause significant odometry drift when published as separate scans. LIO-SAM's ICP scan matching + IMU preintegration prior are robust enough to absorb the additional geometry. This is documented as a negative result — topic-level point cloud injection alone is insufficient to corrupt LIO-SAM's localisation when the real sensor data provides stronger geometric constraints.
 
+### IMU Data Injection (imu_injector / imu_injector_v2)
+
+Publishes fake IMU messages to the target drone's IMU topic. LIO-SAM
+subscribes to `/droneN/imu/data` (the Gazebo-side stream, not MAVROS),
+so any DDS publisher with topic access can inject alongside the real
+sensor data.
+
+#### Original — reused-timestamp variant (`imu_injector.py`)
+
+The original implementation reuses the most recent real IMU message's
+header stamp on each fake publication. This is the version described in
+Section 3.5.5 of the dissertation as a negative result.
+
+```bash
+ros2 run swarm_mission imu_injector --ros-args \
+  -p target_drone:=drone1 \
+  -p mode:=spike \
+  -p injection_rate:=500.0 \
+  -p attack_duration:=30.0
+```
+
+**Findings (original):** blocked by LIO-SAM's `dt <= 0` guard in
+imuPreintegration (Section 13 Patch 1). Each fake message arrives with a
+timestamp identical to a real message LIO-SAM has already processed,
+producing `dt = 0` which the patched guard rejects. No detectable drift
+or crash.
+
+> **Defense attribution caveat:** the blocking guard is a custom patch
+> added to LIO-SAM during this work, not an upstream defense. The
+> "blocked" classification therefore attributes the defense to the
+> modification, not to the system as deployed. The v2 variant below
+> tests this attribution empirically.
+
+#### Advancing-timestamp bypass (`imu_injector_v2.py`)
+
+Same payload modes (`bias`, `spike`, `flip`) but each injected message
+carries a fresh sim-time timestamp from `self.get_clock().now()` rather
+than reusing the latest real IMU's stamp. This guarantees every
+injected message has `dt > 0` against the previously processed message,
+bypassing the dt-guard entirely. Also subscribes to LIO-SAM's odometry
+topic during the trial and records pose drift in the per-second metric
+row — so the bypass's effect on LIO-SAM is measured directly rather
+than inferred from drone behaviour.
+
+```bash
+ros2 run swarm_mission imu_injector_v2 --ros-args \
+  -p target_drone:=drone1 \
+  -p mode:=bias \
+  -p accel_bias_x:=5.0 \
+  -p injection_rate:=500.0 \
+  -p baseline_duration:=15.0 \
+  -p attack_duration:=45.0 \
+  -p recovery_duration:=15.0
+```
+
+**Parameters:**
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| target_drone | drone1 | Which drone to attack |
+| mode | bias | `bias` (constant accel offset), `spike` (large impulse), `flip` (invert gravity) |
+| accel_bias_x/y/z | 5.0/0/0 | Constant accel bias (m/s²) for `bias` mode |
+| spike_magnitude | 30.0 | Spike acceleration (m/s²) for `spike` mode |
+| spike_axis | z | Axis for `spike` mode (`x`/`y`/`z`) |
+| injection_rate | 500.0 | Hz — match or exceed real IMU rate (~500 Hz Gazebo) |
+| baseline_duration | 15.0 | Seconds of pre-attack measurement |
+| attack_duration | 45.0 | Seconds with injection active |
+| recovery_duration | 15.0 | Seconds of post-attack measurement |
+| output_dir | $HOME | CSV output location |
+
+**Trial protocol:**
+
+1. Cold restart full stack (Section 10)
+2. Take off in GPS-hold mode (`VISO_TYPE=0`, GPS on) — same isolation
+   choice as the rotation sweep, so the experiment measures the attack's
+   primary effect on LIO-SAM independently of EKF3 vision-pose fusion
+3. Run preflight, confirm clean baseline
+4. Fire the v2 injector
+5. Watch the live `[A]` log lines for `LIO drift` — the headline number
+6. Cold restart between trials (the same map-corruption considerations
+   apply as in the scan-manipulation sweep)
+
+**Verdict matrix** — printed at trial end, also derivable from the CSV:
+
+| LIO-SAM drift (m) | Drone drift (m) | Interpretation |
+|------------------:|----------------:|---|
+| < 1.0 | < 1.0 | dt-guard wasn't the only defense — LIO-SAM-internal velocity guard or factor-graph constraint intercepts. The original "blocked" classification stands but for a different reason |
+| > 1.0 | < 1.0 | LIO-SAM corrupted; EKF3 innovation gate caught the bad vision_pose. Defense reattributes from "LIO-SAM dt-guard" to "EKF3 innovation gate" |
+| > 1.0 | > 1.0 | Both layers failed — full attack success, dt-guard reclassified as insufficient |
+
+**Output CSV:** `~/imu_injection_v2_metrics_<drone>_<timestamp>.csv` with
+columns `timestamp, phase, phase_elapsed_s, inject_count, drone_drift_m,
+lio_sam_drift_m, drone_x/y/z, lio_x/y/z`.
+
 ### QoS Profile Poisoning (qos_poisoner.py)
 
 Creates RELIABLE subscribers on LIO-SAM's BEST_EFFORT odometry topic, forcing the DDS middleware to satisfy the stricter QoS policy. This causes the odometry output rate to degrade, starving the vision pose bridge below ArduCopter's EKF3 minimum threshold (0.5 Hz), which triggers a Land Mode failsafe.
@@ -1319,3 +1413,6 @@ ros2 topic echo /drone1/lio_sam/mapping/odometry_incremental --qos-reliability r
 | Sweep runner reports zombie nodes | Kill survivors: `pkill -9 -f "swarm_mission.lidar_manipulator"` and same for logger; then `ros2 daemon stop; sleep 1; ros2 daemon start` to flush graph cache |
 | MAVROS `Time jump detected` / EKF3 lane switches | Cosmetic under WSL2 clock irregularities; not blocking unless `/clock` rate drops below ~100 Hz |
 | MAVROS IMU rate 1.9 Hz vs Gazebo IMU 470 Hz | Expected — LIO-SAM uses `/droneN/imu/data` (Gazebo sensor direct), not `/mavros/imu/data`. Don't try to "fix" the MAVROS rate |
+| `imu_injector_v2` shows zero LIO drift during attack | Verify `use_sim_time` is propagating to the injector — `self.get_clock().now()` must return sim-time, not wall-time, or the bypass won't work as intended. Also raise `accel_bias_x` from 5.0 to 10.0 to amplify the effect |
+| Multiple `imu_injector` instances zombie after Ctrl+C | Same cleanup pattern as the scan attacker: `pkill -9 -f "swarm_mission.imu_injector"` then `ros2 daemon stop; sleep 1; ros2 daemon start` |
+| `imu_injector_v2` doesn't see LIO odometry | Check the subscription topic matches your namespace: `/drone1/lio_sam/mapping/odometry` (no `_incremental` suffix). v2 uses the post-mapOptimization output, not the imuPreintegration intermediate |
