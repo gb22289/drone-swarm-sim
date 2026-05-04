@@ -1,0 +1,63 @@
+diff --git a/src/mapOptmization.cpp b/src/mapOptmization.cpp
+index 1fa4451..cb2e2fa 100644
+--- a/src/mapOptmization.cpp
++++ b/src/mapOptmization.cpp
+@@ -457,6 +457,11 @@ public:
+         std::vector<float> pointSearchSqDisGlobalMap;
+         // search near key frames to visualize
+         mtx.lock();
++        // PATCH: bounds-check before KDTree construction (visualisation thread)
++        if (cloudKeyPoses3D->points.empty()) {
++            mtx.unlock();
++            return;
++        }
+         kdtreeGlobalMap->setInputCloud(cloudKeyPoses3D);
+         kdtreeGlobalMap->radiusSearch(cloudKeyPoses3D->back(), globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
+         mtx.unlock();
+@@ -621,6 +626,10 @@ public:
+         // find the closest history key frame
+         std::vector<int> pointSearchIndLoop;
+         std::vector<float> pointSearchSqDisLoop;
++        // PATCH: bounds-check before KDTree construction (loop closure thread)
++        if (copy_cloudKeyPoses3D->points.empty()) {
++            return false;
++        }
+         kdtreeHistoryKeyPoses->setInputCloud(copy_cloudKeyPoses3D);
+         kdtreeHistoryKeyPoses->radiusSearch(copy_cloudKeyPoses3D->back(), historyKeyframeSearchRadius, pointSearchIndLoop, pointSearchSqDisLoop, 0);
+         
+@@ -869,6 +878,10 @@ public:
+         std::vector<float> pointSearchSqDis;
+ 
+         // extract all the nearby key poses and downsample them
++        // PATCH: bounds-check before KDTree construction (surrounding keyframes)
++        if (cloudKeyPoses3D->points.empty()) {
++            return;
++        }
+         kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D); // create kd-tree
+         kdtreeSurroundingKeyPoses->radiusSearch(cloudKeyPoses3D->back(), (double)surroundingKeyframeSearchRadius, pointSearchInd, pointSearchSqDis);
+         for (int i = 0; i < (int)pointSearchInd.size(); ++i)
+@@ -1289,6 +1302,24 @@ public:
+ 
+         if (laserCloudCornerLastDSNum > edgeFeatureMinValidNum && laserCloudSurfLastDSNum > surfFeatureMinValidNum)
+         {
++            // PATCH (Mohai, 2026): bounds-check local-map clouds before KDTree
++            // construction. Manipulated LiDAR scans (Section 3.5.3) can corrupt
++            // feature extraction such that the surrounding-keyframe local map
++            // is left with zero corner or surf features. Without this check,
++            // pcl::KdTreeFLANN::setInputCloud is called on an empty cloud,
++            // which dereferences null data and terminates the mapOptimization
++            // process (exit code -11). This converts the denial-of-process
++            // attack into a denial-of-localisation: the pipeline drops the
++            // affected frame and continues running.
++            if (laserCloudCornerFromMapDS->points.empty() ||
++                laserCloudSurfFromMapDS->points.empty())
++            {
++                RCLCPP_WARN(rclcpp::get_logger("mapOptimization"),
++                    "Empty local map features (corner=%zu, surf=%zu) -- skipping scan-to-map optimisation",
++                    laserCloudCornerFromMapDS->points.size(),
++                    laserCloudSurfFromMapDS->points.size());
++                return;
++            }
+             kdtreeCornerFromMap->setInputCloud(laserCloudCornerFromMapDS);
+             kdtreeSurfFromMap->setInputCloud(laserCloudSurfFromMapDS);
+ 

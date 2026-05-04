@@ -1,0 +1,52 @@
+diff --git a/src/imuPreintegration.cpp b/src/imuPreintegration.cpp
+index 8420c04..f7b4a3f 100644
+--- a/src/imuPreintegration.cpp
++++ b/src/imuPreintegration.cpp
+@@ -209,6 +209,7 @@ public:
+     bool doneFirstOpt = false;
+     double lastImuT_imu = -1;
+     double lastImuT_opt = -1;
++    double lastCorrectionTime = -1;
+ 
+     gtsam::ISAM2 optimizer;
+     gtsam::NonlinearFactorGraph graphFactors;
+@@ -282,13 +283,12 @@ public:
+         doneFirstOpt = false;
+         systemInitialized = false;
+     }
+-
+     void odometryHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg)
+     {
+         std::lock_guard<std::mutex> lock(mtx);
+-
+         double currentCorrectionTime = stamp2Sec(odomMsg->header.stamp);
+-
++        if (currentCorrectionTime <= lastCorrectionTime) return;
++        lastCorrectionTime = currentCorrectionTime;
+         // make sure we have imu data to integrate
+         if (imuQueOpt.empty())
+             return;
+@@ -390,6 +390,7 @@ public:
+             if (imuTime < currentCorrectionTime - delta_t)
+             {
+                 double dt = (lastImuT_opt < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_opt);
++                if (dt <= 0.0) { lastImuT_opt = imuTime; continue; } if (dt > 0.02) dt = 0.02;
+                 imuIntegratorOpt_->integrateMeasurement(
+                         gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
+                         gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
+@@ -458,6 +459,7 @@ public:
+                 sensor_msgs::msg::Imu *thisImu = &imuQueImu[i];
+                 double imuTime = stamp2Sec(thisImu->header.stamp);
+                 double dt = (lastImuQT < 0) ? (1.0 / 500.0) :(imuTime - lastImuQT);
++                if (dt <= 0.0) { lastImuQT = imuTime; continue; } if (dt > 0.02) dt = 0.02;
+ 
+                 imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
+                                                         gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
+@@ -503,6 +505,7 @@ public:
+ 
+         double imuTime = stamp2Sec(thisImu.header.stamp);
+         double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);
++        if (dt <= 0.0) { lastImuT_imu = imuTime; return; } if (dt > 0.02) dt = 0.02;
+         lastImuT_imu = imuTime;
+ 
+         // integrate this single imu message

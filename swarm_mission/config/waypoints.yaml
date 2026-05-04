@@ -1,0 +1,86 @@
+mission:
+  altitude: 2.5
+  tolerance: 1.0
+  hold_time: 3.0
+  timeout: 180.0
+
+waypoints:
+  # --- Drone 1 (IDs 0-8): Open area ---
+  - id: 0
+    x: -8.0
+    y: 2.0
+    label: "open-near-left"
+  - id: 1
+    x: -8.0
+    y: -1.5
+    label: "open-near-center"
+  - id: 2
+    x: -8.0
+    y: -4.5
+    label: "open-near-right"
+  - id: 3
+    x: -10.0
+    y: 2.0
+    label: "open-mid-left"
+  - id: 4
+    x: -10.0
+    y: -1.5
+    label: "open-mid-center"
+  - id: 5
+    x: -10.0
+    y: -4.5
+    label: "open-mid-right"
+  - id: 6
+    x: -13.0
+    y: 2.0
+    label: "open-deep-left"
+  - id: 7
+    x: -13.0
+    y: -1.5
+    label: "open-deep-center"
+  - id: 8
+    x: -13.0
+    y: -4.5
+    label: "open-deep-right"
+
+  # --- Drone 2 (IDs 9-17): Shelving area ---
+  - id: 9
+    x: 1.0
+    y: 2.0
+    label: "shelf-near-left"
+  - id: 10
+    x: 1.0
+    y: -1.5
+    label: "shelf-near-center"
+  - id: 11
+    x: 1.0
+    y: -4.5
+    label: "shelf-near-right"
+  - id: 12
+    x: 5.0
+    y: 2.0
+    label: "shelf-mid-left"
+  - id: 13
+    x: 5.0
+    y: -1.5
+    label: "shelf-mid-center"
+  - id: 14
+    x: 5.0
+    y: -4.5
+    label: "shelf-mid-right"
+  - id: 15
+    x: 9.0
+    y: 2.0
+    label: "shelf-deep-left"
+  - id: 16
+    x: 9.0
+    y: -1.5
+    label: "shelf-deep-center"
+  - id: 17
+    x: 9.0
+    y: -4.5
+    label: "shelf-deep-right"
+
+zones:
+  drone1: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+  drone2: [9, 10, 11, 12, 13, 14, 15, 16, 17]
