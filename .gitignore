@@ -1,0 +1,16 @@
+# Build artefacts
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.so
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
