@@ -1,4 +1,0 @@
-/**:
-  ros__parameters:
-    tf_prefix: "drone1"
-    use_sim_time: true
