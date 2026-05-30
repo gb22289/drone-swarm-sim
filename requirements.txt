@@ -1,0 +1,14 @@
+# Python dependencies for the analysis / scaling-simulator code.
+#
+# Note: ROS2 Python packages (rclpy, sensor_msgs, geometry_msgs, std_msgs,
+# nav_msgs, mavros_msgs, tf2_ros, etc.) are NOT listed here — they come
+# from the ROS2 Humble apt install and are picked up automatically when
+# the workspace is sourced (install/setup.bash).
+#
+# These pip-installable packages are required by the plotting scripts,
+# the lite scaling simulator, and the data-analysis helpers.
+
+numpy>=1.23
+matplotlib>=3.6
+pandas>=1.5
+scipy>=1.9

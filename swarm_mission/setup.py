@@ -10,7 +10,6 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/config', ['config/waypoints.yaml']),
-        ('share/' + package_name + '/launch', ['launch/mission.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -35,6 +34,7 @@ setup(
             'slam_failure_logger = swarm_mission.slam_failure_logger:main',
             'lidar_deskew_shim = swarm_mission.lidar_deskew_shim:main',
             'imu_injector_v2 = swarm_mission.imu_injector_v2:main',
+            'network_attacker = swarm_mission.network_attacker:main',
         ],
     },
 )

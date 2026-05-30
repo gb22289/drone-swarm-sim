@@ -29,6 +29,7 @@ This repository contains the attack and defence nodes, configuration, experiment
 | `lio_sam_config/` | LIO-SAM YAML configurations for drone1 and drone2 |
 | `configs/` | ros_gz_bridge, MAVROS, and Gazebo SDF configurations |
 | `scripts/` | Experiment automation, pre-flight validation, plotting, audit |
+| `scaling/` | Lite discrete-event simulator + Sybil-4 / interleaved attacker variants for the N ∈ {5, 10} scaling experiments (Section 5) |
 | `data/` | Raw experimental data (CSVs) |
 | `docs/` | Detailed setup, launch, attack, and troubleshooting documentation |
 
@@ -117,6 +118,7 @@ Validates IMU and LiDAR rates, vision_pose flow, drone hover position, LIO-SAM o
 | `data/scan_sweep_summary.csv` | TTF measurements for the rotation-rate sweep (Section 3.5.3), pre and post KDTree-patch |
 | `data/layer1_mission_results.csv` | Per-waypoint ground-truth measurements for Layer 1 attacks (Section 3.4) |
 | `data/imu_injection_v2_metrics_*.csv` | LIO-SAM and drone drift trajectories during advancing-stamp IMU injection (Section 3.5.5) |
+| `data/scaling_results.csv` | Aggregated lite discrete-event simulator sweep across N ∈ {2, 5, 10} and all coordination-layer scenarios (Section 5, Table VII) |
 
 ---
 
@@ -159,7 +161,7 @@ Both patches are also documented inline in their respective `.patch` files.
 
 If you use this code, please cite:
 
-> Mohai, P. *Breaking Trust in the Swarm: A Security Analysis of ROS2-Based Cooperative Drone Systems.* MEng dissertation, University of Bristol, 2026.
+> P. Mohai and A. Oracevic, "Breaking Trust, Breaking SLAM: A Security Analysis of ROS2-Based GPS-Denied Drone Swarms," *IEEE Trans. Intell. Transp. Syst.*, 2026.
 
 ---
 
